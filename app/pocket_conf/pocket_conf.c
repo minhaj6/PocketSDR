@@ -10,6 +10,7 @@
 //  2024-06-29  1.1  support API changes of sdr_conf.c
 //
 #include "pocket_sdr.h"
+#include "sdr_conf_path.h"
 
 // constants and macro ---------------------------------------------------------
 #define PROG_NAME       "pocket_conf" // program name
@@ -24,7 +25,7 @@ static void print_ver(void)
 // show usage ------------------------------------------------------------------
 static void show_usage(void)
 {
-    printf("Usage: %s [-s] [-a] [-h] [conf_file]\n", PROG_NAME);
+    printf("Usage: %s [-s] [-a] [-h] [--list] [--show name] [conf_file]\n", PROG_NAME);
     exit(0);
 }
 
@@ -47,10 +48,16 @@ int main(int argc, char **argv)
             sscanf(argv[++i], "%d,%d", &bus, &port);
         } else if (!strcmp(argv[i], "-v")) {
             print_ver();
+        } else if (!strcmp(argv[i], "--list")) {
+            sdr_conf_list();
+            return 0;
+        } else if (!strcmp(argv[i], "--show") && i + 1 < argc) {
+            sdr_conf_show(argv[++i]);
+            return 0;
         } else if (!strncmp(argv[i], "-", 1)) {
             show_usage();
         } else {
-            file = argv[i];
+            file = sdr_conf_resolve(argv[i]);
         }
     }
     if (!(dev = sdr_dev_open(bus, port))) {

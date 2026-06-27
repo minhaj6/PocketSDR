@@ -1,20 +1,15 @@
 #!/bin/bash
 #
-#  Remove PocketSDR command-line tools installed by install.sh.
-#
-#  Usage:
-#    ./uninstall.sh                        remove from /usr/local/bin (default)
-#    PREFIX=/opt/pocketsdr ./uninstall.sh  remove from /opt/pocketsdr/bin
+#  Remove PocketSDR command-line tools and config presets installed by install.sh.
 #
 set -eu
 
-PREFIX="${PREFIX:-/usr/local}"
-BINDIR="$PREFIX/bin"
+BINDIR=/usr/local/bin
+SHAREDIR=/usr/local/share/pocketsdr
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-# elevate only when the destination isn't writable
 SUDO=""
-if [ "$(id -u)" -ne 0 ] && [ ! -w "$BINDIR" ]; then SUDO="sudo"; fi
+if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
 
 # tool names = extensionless executables built under app/*/ (matches install)
 removed=0
@@ -29,4 +24,10 @@ for f in "$ROOT"/app/*/*; do
         fi
     fi
 done
-echo "Removed $removed tool(s) from $BINDIR"
+
+if [ -d "$SHAREDIR" ]; then
+    echo "removing $SHAREDIR"
+    $SUDO rm -rf "$SHAREDIR"
+fi
+
+echo "Removed $removed tool(s) from $BINDIR and presets from $SHAREDIR"

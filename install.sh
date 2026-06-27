@@ -1,17 +1,16 @@
 #!/bin/bash
 #
-#  Install PocketSDR command-line tools system-wide.
+#  Install PocketSDR command-line tools and config presets system-wide.
 #
 #  Build them first:   make -C app
 #
-#  Usage:
-#    ./install.sh                        install to /usr/local/bin (default)
-#    PREFIX=/opt/pocketsdr ./install.sh  install to /opt/pocketsdr/bin
+#    binaries -> /usr/local/bin
+#    presets  -> /usr/local/share/pocketsdr/conf
 #
 set -eu
 
-PREFIX="${PREFIX:-/usr/local}"
-BINDIR="$PREFIX/bin"
+BINDIR=/usr/local/bin
+CONFDIR=/usr/local/share/pocketsdr/conf
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # install only copies binaries -- make sure they were built first.
@@ -27,10 +26,15 @@ if [ "$built" -eq 0 ]; then
     exit 1
 fi
 
-# elevate only when the destination isn't writable
 SUDO=""
-if [ "$(id -u)" -ne 0 ] && [ ! -w "$PREFIX" ]; then SUDO="sudo"; fi
+if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; fi
 
+# binaries
 $SUDO mkdir -p "$BINDIR"
 $SUDO make -C "$ROOT/app" install BIN="$BINDIR"
-echo "Installed $built tool(s) to $BINDIR"
+
+# config presets
+$SUDO mkdir -p "$CONFDIR"
+$SUDO cp "$ROOT"/conf/*.conf "$CONFDIR"/
+
+echo "Installed $built tool(s) to $BINDIR and presets to $CONFDIR"
