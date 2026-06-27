@@ -7,7 +7,7 @@
 
 ---
 
-## Some thoughts regarding my's fork
+## Some thoughts regarding my fork
 
 I am making some changes that make my life easier when configuring the pocketsdr front-ends and collecting data with them. Dr. Takasu has done an amazing job with this project. I don't intend to submit a pull request to the upstream as these changes may go against the design choices Dr. Takasu made and may not want it in his repo.
 
