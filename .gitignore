@@ -8,3 +8,16 @@
 .vscode
 .claude
 __pycache__
+
+# minhaj fork: local build outputs
+/bin/
+/app/pocket_scan/pocket_scan
+/app/pocket_conf/pocket_conf
+/app/pocket_dump/pocket_dump
+/app/pocket_acq/pocket_acq
+/app/pocket_trk/pocket_trk
+/app/pocket_trk/fftw_wisdom
+/app/pocket_snap/pocket_snap
+/app/pocket_calib/pocket_calib
+/app/convbin/convbin
+/app/str2str/str2str
