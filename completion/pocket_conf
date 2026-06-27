@@ -1,0 +1,19 @@
+# bash completion for pocket_conf
+#
+# Config names come from `pocket_conf --list`, so newly added presets appear
+# in completion automatically with no edits here.
+
+_pocket_conf()
+{
+    local cur names
+    cur="${COMP_WORDS[COMP_CWORD]}"
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "-s -a -h -p -v --list --show" -- "$cur") )
+        return
+    fi
+
+    names=$(pocket_conf --list 2>/dev/null | awk '/\.conf/{print $1}')
+    COMPREPLY=( $(compgen -W "$names" -- "$cur") )
+}
+complete -F _pocket_conf -o default pocket_conf

@@ -7,6 +7,23 @@
 
 ---
 
+## Some thoughts regarding my's fork
+
+I am making some changes that make my life easier when configuring the pocketsdr front-ends and collecting data with them. Dr. Takasu has done an amazing job with this project. I don't intend to submit a pull request to the upstream as these changes may go against the design choices Dr. Takasu made and may not want it in his repo.
+
+### My changes
+**System level install** 
+- `install.sh` and `uninstall.sh` scripts to put the binaries in system bin (`/usr/local/bin/`), so the programs can be accessed from anywhere.
+
+**Configuration file handling**
+- The configuration files installed to system level `/usr/local/share/pocketsdr/conf/` and user-modifiable `~/.config/pocketsdr/`.
+- `pocket_conf` app now has a new options `--list` and `--show` to list existing configuration files and show the path of the configuration file.
+- A single header file that resolves paths of configuration file. If a absolute/relative path is given to the `pocket_conf` app for the configuration file, it will use that path. If only a configuration file name is mentioned, it will first search is the `~/.config/pocketsdr/` and then `/usr/local/share/pocketsdr/conf` respectively.
+- Bash autocompletion for the configuration file names. `pocket_conf<TAB>` to autocomplete your configuration file names!
+
+All of this is to make the user experience smoother when collecting data with the front-ends. I intend to pull updates from Dr. Takasu's repository periodically, as long as I am actively using the pocketsdr devices (probably for a long time). I will be happy if these additions are useful to you. Cheers!
+
+
 ## **Overview**
 
 **Pocket SDR** is an open-source Global Navigation Satellite System (GNSS) receiver based

@@ -37,4 +37,13 @@ $SUDO make -C "$ROOT/app" install BIN="$BINDIR"
 $SUDO mkdir -p "$CONFDIR"
 $SUDO cp "$ROOT"/conf/*.conf "$CONFDIR"/
 
+# bash completion (only if the bash-completion framework is installed)
+COMPDIR=/usr/share/bash-completion/completions
+if [ -d "$COMPDIR" ]; then
+    $SUDO cp "$ROOT/completion/pocket_conf" "$COMPDIR/pocket_conf"
+    echo "Installed bash completion to $COMPDIR/pocket_conf"
+else
+    echo "bash-completion not found; skipped (script kept at completion/pocket_conf)"
+fi
+
 echo "Installed $built tool(s) to $BINDIR and presets to $CONFDIR"

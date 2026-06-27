@@ -30,4 +30,10 @@ if [ -d "$SHAREDIR" ]; then
     $SUDO rm -rf "$SHAREDIR"
 fi
 
+COMP=/usr/share/bash-completion/completions/pocket_conf
+if [ -e "$COMP" ]; then
+    echo "removing $COMP"
+    $SUDO rm -f "$COMP"
+fi
+
 echo "Removed $removed tool(s) from $BINDIR and presets from $SHAREDIR"
