@@ -18,6 +18,10 @@
 //  2024-06-29  1.7  add API sdr_dev_get_info(), sdr_dev_set_gain(),
 //                   sdr_dev_get_gain()
 //  2024-12-30  1.8  add API sdr_dev_get_filt(), sdr_dev_set_filt()
+//  2026-07-04  1.9  fix display corruption by async scheduling error message
+//  2026-08-07  1.10 recover a FE left streaming by a killed session
+//  2026-09-28  1.11 enlarge raw data buffer beyond USB transfers in flight
+//                   detect raw data buffer overflow
 //
 #include "pocket_sdr.h"
 #ifdef WIN32
@@ -26,9 +30,15 @@
 #endif
 
 // constants and macros --------------------------------------------------------
-#define BUFF_SIZE     (SDR_SIZE_UBUFF * SDR_MAX_UBUFF)
+#define NUM_BUFF      128     // number of USB buffers in raw data buffer
+#define BUFF_SIZE     (SDR_SIZE_UBUFF * NUM_BUFF)
 #define TO_TRANSFER   3000    // USB transfer timeout (ms)
 #define TIMER_RES     1       // timer resolution for Windows (ms)
+#define DEV_STOP_MS   50      // settle time after bulk transfer stop (ms)
+#define DEV_RESET_MS  1500    // wait for re-enumeration after USB reset (ms)
+
+// bulk transfer status of FE 4CH/8CH in the device status ---------------------
+#define BULK_ACT(data) (((data)[3] >> 4) & 1)
 
 // read MAX2771 status ---------------------------------------------------------
 static int read_MAX2771_stat(sdr_dev_t *dev, int ch, double fx, double *fs,
@@ -129,8 +139,7 @@ static void rise_pri(void)
     if (h == 0) {
         fprintf(stderr, "AvSetMmThreadCharacteristicsA error (%d)\n",
             (int)GetLastError());
-    }
-    else if (!AvSetMmThreadPriority(h, AVRT_PRIORITY_CRITICAL)) {
+    } else if (!AvSetMmThreadPriority(h, AVRT_PRIORITY_CRITICAL)) {
         fprintf(stderr, "AvSetMmThreadPriority error (%d)\n",
             (int)GetLastError());
     }
@@ -151,11 +160,14 @@ static CCyBulkEndPoint *get_bulk_ep(sdr_usb_t *usb, int ep)
 }
 
 // USB event handler thread ----------------------------------------------------
+//   Only SDR_MAX_UBUFF transfers are in flight. A completed transfer is
+//   resubmitted to the buffer SDR_MAX_UBUFF blocks ahead in the raw data
+//   buffer, so the reader may lag behind by up to NUM_BUFF - 1 buffers.
 static void *event_handler(void *arg)
 {
     sdr_dev_t *dev = (sdr_dev_t *)arg;
     CCyBulkEndPoint *ep;
-    uint8_t *ctx[SDR_MAX_UBUFF] = {0};
+    uint8_t *ctx[SDR_MAX_UBUFF] = {0}, *buff[SDR_MAX_UBUFF];
     OVERLAPPED ov[SDR_MAX_UBUFF] = {{0,0,0,0,0}};
     long len = SDR_SIZE_UBUFF;
     
@@ -172,26 +184,29 @@ static void *event_handler(void *arg)
         return 0;
     }
     ep->SetXferSize(SDR_SIZE_UBUFF);
+    int64_t n = dev->wp / len; // next block to submit
     for (int i = 0; i < SDR_MAX_UBUFF; i++) {
         ov[i].hEvent = CreateEvent(NULL, false, false, NULL);
-        ctx[i] = ep->BeginDataXfer(dev->buff + len * i, len, &ov[i]); 
+        buff[i] = dev->buff + len * (int)(n++ % NUM_BUFF);
+        ctx[i] = ep->BeginDataXfer(buff[i], len, &ov[i]);
     }
     for (int i = 0; dev->state; ) {
         if (!ep->WaitForXfer(&ov[i], 100)) {
             continue;
         }
-        if (!ep->FinishDataXfer(dev->buff + len * i, len, &ov[i], ctx[i])) {
+        if (!ep->FinishDataXfer(buff[i], len, &ov[i], ctx[i])) {
             fprintf(stderr, "bulk transfer error\n");
             break;
         }
-        ctx[i] = ep->BeginDataXfer(dev->buff + len * i, len, &ov[i]);
+        buff[i] = dev->buff + len * (int)(n++ % NUM_BUFF);
+        ctx[i] = ep->BeginDataXfer(buff[i], len, &ov[i]);
         sdr_mutex_lock(&dev->mtx);
         dev->wp += len;
         sdr_mutex_unlock(&dev->mtx);
         i = (i + 1) % SDR_MAX_UBUFF;
     }
     for (int i = 0; i < SDR_MAX_UBUFF; i++) {
-        ep->FinishDataXfer(dev->buff + len * i, len, &ov[i], ctx[i]);
+        ep->FinishDataXfer(buff[i], len, &ov[i], ctx[i]);
         CloseHandle(ov[i].hEvent);
     }
     return 0;
@@ -200,6 +215,8 @@ static void *event_handler(void *arg)
 #else // WIN32
 
 // USB bulk transfer callback --------------------------------------------------
+//   The transfers complete in order. A completed transfer is resubmitted to the
+//   buffer SDR_MAX_UBUFF blocks ahead in the raw data buffer.
 static void transfer_cb(struct libusb_transfer *transfer)
 {
     sdr_dev_t *dev = (sdr_dev_t *)transfer->user_data;
@@ -210,8 +227,10 @@ static void transfer_cb(struct libusb_transfer *transfer)
     }
     sdr_mutex_lock(&dev->mtx);
     dev->wp += SDR_SIZE_UBUFF;
+    int64_t n = dev->wp / SDR_SIZE_UBUFF - 1 + SDR_MAX_UBUFF; // next block
     sdr_mutex_unlock(&dev->mtx);
     
+    transfer->buffer = dev->buff + SDR_SIZE_UBUFF * (int)(n % NUM_BUFF);
     libusb_submit_transfer(transfer);
 }
 
@@ -224,17 +243,50 @@ static void *event_handler(void *arg)
     
     dev->rp = dev->wp = 0;
     
-    // set thread scheduling real-time
+    // set thread scheduling real-time (log only - async stderr breaks display)
     if (pthread_setschedparam(dev->thread, SCHED_RR, &param)) {
-        fprintf(stderr, "set thread scheduling error\n");
+        sdr_log(3, "$LOG,%.3f,%s,%d,set thread scheduling error", 0.0, "", 0);
     }
     while (dev->state) {
-        if (libusb_handle_events_timeout(NULL, &to)) continue;
+        if (libusb_handle_events_timeout(dev->usb->ctx, &to)) continue;
     }
     return NULL;
 }
 
 #endif // WIN32
+
+// recover a SDR device left streaming by a previous session -------------------
+//   A session killed without sdr_dev_stop() leaves the bulk transfer running.
+//   The FE 4CH/8CH reports it in the same status bit that sdr_dev_get_info()
+//   reads as the device type, so the FE is then taken for a Spider SDR, and its
+//   DMA channel stays wedged, which VR_STOP alone does not clear. Only a USB
+//   reset recovers it (the vendor request VR_RESET does not work). The bit is
+//   the device type of a Spider SDR, which VR_STOP leaves untouched.
+static sdr_usb_t *recover_dev(sdr_usb_t *usb, int bus, int port,
+    const uint16_t *vid, const uint16_t *pid)
+{
+    uint8_t data[6];
+
+    if (!sdr_usb_req(usb, 0, SDR_VR_STAT, 0, data, 6) || !BULK_ACT(data)) {
+        return usb;
+    }
+    sdr_usb_req(usb, 0, SDR_VR_STOP, 0, NULL, 0);
+    sdr_sleep_msec(DEV_STOP_MS);
+
+    if (!sdr_usb_req(usb, 0, SDR_VR_STAT, 0, data, 6) || BULK_ACT(data)) {
+        return usb; // not a bulk transfer status - leave the device alone
+    }
+    fprintf(stderr, "SDR device left streaming by the previous session - "
+        "resetting.\n");
+    sdr_usb_reset(usb);
+    sdr_usb_close(usb);
+    sdr_sleep_msec(DEV_RESET_MS);
+
+    if (!(usb = sdr_usb_open(bus, port, vid, pid, 2))) {
+        fprintf(stderr, "SDR device reset error.\n");
+    }
+    return usb;
+}
 
 //------------------------------------------------------------------------------
 //  Open a SDR device.
@@ -255,6 +307,10 @@ sdr_dev_t *sdr_dev_open(int bus, int port)
     if (!(dev->usb = sdr_usb_open(bus, port, vid, pid, 2))) {
         fprintf(stderr, "No device found. BUS=%d PORT=%d VID=%04X PID=%04X,%04X\n",
             bus, port, SDR_DEV_VID, SDR_DEV_PID1, SDR_DEV_PID2);
+        sdr_free(dev);
+        return NULL;
+    }
+    if (!(dev->usb = recover_dev(dev->usb, bus, port, vid, pid))) {
         sdr_free(dev);
         return NULL;
     }
@@ -358,12 +414,22 @@ int sdr_dev_stop(sdr_dev_t *dev)
 //  return
 //      data size read (0: insufficent data) (bytes)
 //
+//  notes:
+//      If the reader lags behind so far that the unread data may have been
+//      overwritten by the USB transfers, the unread data are discarded and
+//      dev->novr is incremented.
+//
 int sdr_dev_read(sdr_dev_t *dev, uint8_t *buff, int size)
 {
     sdr_mutex_lock(&dev->mtx);
     int64_t wp = dev->wp;
     sdr_mutex_unlock(&dev->mtx);
     
+    if (wp - dev->rp > BUFF_SIZE - SDR_SIZE_UBUFF) { // raw data buffer overflow
+        dev->rp = wp;
+        dev->novr++;
+        return 0;
+    }
     if (wp < dev->rp + size) {
         return 0;
     }
@@ -371,8 +437,7 @@ int sdr_dev_read(sdr_dev_t *dev, uint8_t *buff, int size)
     
     if (rp + size <= BUFF_SIZE) {
         memcpy(buff, dev->buff + rp, size);
-    }
-    else {
+    } else {
         memcpy(buff, dev->buff + rp, BUFF_SIZE - rp);
         memcpy(buff + BUFF_SIZE - rp, dev->buff, size - BUFF_SIZE + rp);
     }
@@ -417,8 +482,7 @@ int sdr_dev_get_info(sdr_dev_t *dev, int *fmt, double *fs, double *fo, int *IQ,
             }
             if (i == 0) *fs = fss;
         }
-    }
-    else { // Pocket SDR FE
+    } else { // Pocket SDR FE
         int ver = data[0] >> 4; // 1-2: FE 2CH, 3: FE 4CH, 4: FE 8CH
         *fmt = (ver <= 2) ? SDR_FMT_RAW8 : ((ver <= 3) ? SDR_FMT_RAW16 : SDR_FMT_RAW32);
         nch = (ver <= 2) ? 2 : ((ver <= 3) ? 4 : 8);
@@ -460,8 +524,7 @@ int sdr_dev_set_gain(sdr_dev_t *dev, int ch, int gain)
         reg1[2] = (reg1[2] & ~0x18) + (2 << 3); // AGCMODE = 2
         reg2[0] = (reg2[0] & ~0x0F) + (((gain - 1) >> 2) & 0x0F); // GAININ[5:2]
         reg2[1] = (reg2[1] & ~0xC0) + (((gain - 1) << 6) & 0xC0); // GAININ[1:0]
-    }
-    else { // AGC
+    } else { // AGC
         reg1[2] = (reg1[2] & ~0x18); // AGCMODE = 0
     }
     // write MAX2771 registers
@@ -483,8 +546,7 @@ int sdr_dev_get_gain(sdr_dev_t *dev, int ch)
     }
     if (((reg1[2] >> 3) & 0x03) == 2) { // manual gain
         return ((reg2[0] & 0x0F) << 2) + (reg2[1] >> 6) + 1;
-    }
-    else { // AGC
+    } else { // AGC
         return 0;
     }
 }

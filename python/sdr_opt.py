@@ -7,6 +7,8 @@
 #  History:
 #  2024-06-10  1.0  new
 #  2024-12-30  1.1  update input options, output options, system options
+#  2026-07-19  1.2  add low-C/N0 acquisition and tracking options
+#  2026-07-24  1.3  support up to 8 output streams with selectable types
 #
 import os, webbrowser, subprocess
 from tkinter import *
@@ -17,11 +19,23 @@ import sdr_rtk
 
 # constants --------------------------------------------------------------------
 MAX_RFCH = 8           # max number of RF channels
+MAX_STR  = 8           # max number of output streams
+STR_TYPES = ('NMEA', 'RTCM3', 'LOG', 'IF Data') # output stream types
+STR_FILE_TYPES = {     # file dialog types by output stream type
+    'NMEA'   : [('NMEA File', '*.nmea'), ('All', '*.*')],
+    'RTCM3'  : [('RTCM3 File', '*.rtcm3'), ('All', '*.*')],
+    'LOG'    : [('Log File', '*.log'), ('All', '*.*')],
+    'IF Data': [('Raw IF Log', '*.bin'), ('All', '*.*')]}
 BG_COLOR = '#F8F8F8'   # background color
 DLG_MARGIN = (20, 15)  # dialog margin
 BAND_LINK = 'file://' + os.path.dirname(__file__) + '/../doc/signal_bands.pdf'
 SIG_LINK = 'file://' + os.path.dirname(__file__) + '/../doc/signal_IDs.pdf'
 FONT = ('Tahoma', 9, 'normal')
+F_LO = ('1176.450', '1191.795', '1202.025', '1207.140', '1227.600', '1246.000',
+    '1248.060', '1268.520', '1278.750', '1561.098', '1575.420', '1602.000',
+    '1600.995', '2492.028')
+RO_WIDGETS = (         # widget classes disabled in a reference only dialog
+    'TEntry', 'TCombobox', 'TCheckbutton', 'TRadiobutton', 'TButton')
 
 # general object class ---------------------------------------------------------
 class Obj: pass
@@ -50,10 +64,12 @@ def modal_dlg_new(root, width, height, title='', nocancel=0):
     dlg.panel.pack(fill=BOTH, expand=1, padx=DLG_MARGIN[0], pady=DLG_MARGIN[1])
     dlg.btns = Frame(dlg.panel, bg=BG_COLOR)
     dlg.btns.pack(side=BOTTOM, fill=X)
+    dlg.btn_cancel = None
     if not nocancel:
         btn2 = ttk.Button(dlg.btns, width=12, padding=(2, 2), text='Cancel')
         btn2.bind('<Button-1>', lambda e: on_modal_dlg_cancel(e, dlg))
         btn2.pack(side=RIGHT, padx=1)
+        dlg.btn_cancel = btn2
     btn1 = ttk.Button(dlg.btns, width=12, padding=(2, 2), text='OK')
     btn1.bind('<Button-1>', lambda e: on_modal_dlg_ok(e, dlg))
     btn1.pack(side=TOP if nocancel else RIGHT, padx=1)
@@ -62,8 +78,26 @@ def modal_dlg_new(root, width, height, title='', nocancel=0):
     dlg.win.grab_set()
     return dlg
 
+# set modal dialog to reference only -------------------------------------------
+#   The buttons are bound to <Button-1> which fires even when they are disabled,
+#   so their callbacks check the state as well.
+def modal_dlg_readonly(dlg, title=''):
+    for c in dlg.panel.winfo_children():
+        config_widget_disable(c)
+    if dlg.btn_cancel != None: # the dialog is left by Cancel or the close box
+        dlg.btn_cancel.configure(state=NORMAL)
+    dlg.win.title(title + ' (Reference Only)')
+
+# disable input widgets in a widget tree ---------------------------------------
+def config_widget_disable(w):
+    if w.winfo_class() in RO_WIDGETS or getattr(w, 'ro_dis', 0):
+        w.configure(state=DISABLED)
+    for c in w.winfo_children():
+        config_widget_disable(c)
+
 # modal dialog OK callback -----------------------------------------------------
 def on_modal_dlg_ok(e, dlg):
+    if e.widget.instate(('disabled',)): return
     dlg.ok = 1
     dlg.win.destroy()
 
@@ -76,8 +110,10 @@ def custom_btn_new(parent, label='', font=FONT):
     p = Obj()
     p.panel = Frame(parent, bg='#AAAAAA')
     p.btn = ttk.Label(p.panel, text=label, anchor=CENTER, background='white')
+    p.btn.ro_dis = 1 # disabled as a button in a reference only dialog
     p.btn.pack(expand=1, fill=BOTH, padx=1, pady=1)
-    p.btn.bind('<Enter>', lambda e: e.widget.configure(background = '#DDDDDD'))
+    p.btn.bind('<Enter>', lambda e: not e.widget.instate(('disabled',)) and
+        e.widget.configure(background = '#DDDDDD'))
     p.btn.bind('<Leave>', lambda e: e.widget.configure(background = 'white'))
     return p
 
@@ -141,6 +177,7 @@ def path_panel_new(parent, label, out=0, var_path=None, var_ena=None, types=[],
 
 # option path button push callback ---------------------------------------------
 def on_path_btn_push(e, p, var, out=0, types=()):
+    if e.widget.instate(('disabled',)): return
     if out:
         path = filedialog.asksaveasfilename(parent=p, title='Output File Path',
             filetypes=types)
@@ -219,19 +256,25 @@ def inp_opt_new(opt_p=None):
 # generate output option variables ---------------------------------------------
 def out_opt_new(opt_p=None):
     opt = Obj()
-    opt.log = ('TIME', 'POS', 'ATT', 'OBS', 'NAV', 'SAT', 'CH', 'EPH', 'ALM', 'LOG')
-    opt.path_ena = [IntVar() for i in range(4)]
-    opt.path = [StringVar() for i in range(4)]
+    opt.log = ('TIME', 'POS', 'ATT', 'OBS', 'NAV', 'SAT', 'CH', 'EPH', 'ALM', 'LOG', 'SENS')
+    opt.path_ena = [IntVar() for i in range(MAX_STR)]
+    opt.str_type = [StringVar() for i in range(MAX_STR)]
+    opt.path = [StringVar() for i in range(MAX_STR)]
     opt.log_sel = [IntVar() for s in opt.log]
     opt.array_sep = IntVar()
     if opt_p != None:
-        for i in range(4):
+        for i in range(MAX_STR):
             opt.path_ena[i].set(opt_p.path_ena[i].get())
+            opt.str_type[i].set(opt_p.str_type[i].get())
             opt.path[i].set(opt_p.path[i].get())
         for i in range(len(opt.log_sel)):
             opt.log_sel[i].set(opt_p.log_sel[i].get())
         opt.array_sep.set(opt_p.array_sep.get())
     else:
+        for i in range(MAX_STR):
+            # defaults keep the former fixed assignment for streams 1-4
+            opt.str_type[i].set(STR_TYPES[i] if i < len(STR_TYPES) else
+                STR_TYPES[0])
         for i in range(len(opt.log_sel)):
             opt.log_sel[i].set(0 if i in (2, 6, 7, 8) else 1)
     return opt
@@ -252,6 +295,7 @@ def sig_opt_new(opt_p=None):
     opt.sys_sel = [IntVar() for s in opt.sys]
     opt.satno = [StringVar() for s in opt.sys]
     opt.sig_sel = [[IntVar() for s in opt.sig[i]] for i in range(len(opt.sig))]
+    opt.sig_satno = StringVar()
     opt.sig_rfch = StringVar()
     if opt_p != None:
         for i in range(len(opt.sys_sel)):
@@ -259,6 +303,7 @@ def sig_opt_new(opt_p=None):
             opt.satno[i].set(opt_p.satno[i].get())
             for j in range(len(opt.sig_sel[i])):
                 opt.sig_sel[i][j].set(opt_p.sig_sel[i][j].get())
+        opt.sig_satno.set(opt_p.sig_satno.get())
         opt.sig_rfch.set(opt_p.sig_rfch.get())
     else:
         for i in range(len(opt.satno)):
@@ -274,6 +319,8 @@ def sys_opt_new(opt_p=None):
     opt.acq_mode = StringVar()
     opt.sp_corr = StringVar()
     opt.t_acq = StringVar()
+    opt.t_acq_ext = StringVar()
+    opt.t_coh = StringVar()
     opt.t_dll = StringVar()
     opt.b_dll = StringVar()
     opt.b_pll = StringVar()
@@ -281,6 +328,7 @@ def sys_opt_new(opt_p=None):
     opt.b_fll_n = StringVar()
     opt.max_dop = StringVar()
     opt.thres_cn0_l = StringVar()
+    opt.thres_cn0_ext = StringVar()
     opt.thres_cn0_u = StringVar()
     opt.thres_pli = StringVar()
     opt.lost_th = StringVar()
@@ -295,6 +343,8 @@ def sys_opt_new(opt_p=None):
         opt.acq_mode.set(opt_p.acq_mode.get())
         opt.sp_corr.set(opt_p.sp_corr.get())
         opt.t_acq.set(opt_p.t_acq.get())
+        opt.t_acq_ext.set(opt_p.t_acq_ext.get())
+        opt.t_coh.set(opt_p.t_coh.get())
         opt.t_dll.set(opt_p.t_dll.get())
         opt.b_dll.set(opt_p.b_dll.get())
         opt.b_pll.set(opt_p.b_pll.get())
@@ -302,6 +352,7 @@ def sys_opt_new(opt_p=None):
         opt.b_fll_n.set(opt_p.b_fll_n.get())
         opt.max_dop.set(opt_p.max_dop.get())
         opt.thres_cn0_l.set(opt_p.thres_cn0_l.get())
+        opt.thres_cn0_ext.set(opt_p.thres_cn0_ext.get())
         opt.thres_cn0_u.set(opt_p.thres_cn0_u.get())
         opt.thres_pli.set(opt_p.thres_pli.get())
         opt.lost_th.set(opt_p.lost_th.get())
@@ -313,9 +364,11 @@ def sys_opt_new(opt_p=None):
         opt.epoch.set('1.0')
         opt.lag_epoch.set('0.8')
         opt.el_mask.set('15')
-        opt.acq_mode.set('Full-Search')
+        opt.acq_mode.set('Full')
         opt.sp_corr.set('0.25')
         opt.t_acq.set('0.02')
+        opt.t_acq_ext.set('0.1')
+        opt.t_coh.set('0.02')
         opt.t_dll.set('0.02')
         opt.b_dll.set('0.5')
         opt.b_pll.set('10.0')
@@ -323,7 +376,8 @@ def sys_opt_new(opt_p=None):
         opt.b_fll_n.set('5.0')
         opt.max_dop.set('5000')
         opt.thres_cn0_l.set('34.0')
-        opt.thres_cn0_u.set('30.0')
+        opt.thres_cn0_ext.set('30.0')
+        opt.thres_cn0_u.set('25.0')
         opt.thres_pli.set('0.25')
         opt.lost_th.set('4')
         opt.bump_jump.set('OFF')
@@ -434,9 +488,10 @@ def read_opt(val, opt):
         val.set(opt)
 
 # show Input Options dialog ----------------------------------------------------
-def inp_opt_dlg(root, opt):
+def inp_opt_dlg(root, opt, readonly=0):
     opt_new = inp_opt_new(opt)
-    dlg = modal_dlg_new(root, 510, 600, 'Input Options')
+    title = 'Input Options'
+    dlg = modal_dlg_new(root, 510, 600, title)
     panel = Frame(dlg.panel, width=450, bg=BG_COLOR)
     panel.pack(fill=X, pady=4)
     ttk.Label(panel, text='Input Source').pack(side=LEFT, padx=4)
@@ -456,11 +511,13 @@ def inp_opt_dlg(root, opt):
     btn1.bind('<Button-1>', lambda e: on_inp_select(e, 0, p1, p2, p3, p4))
     btn2.bind('<Button-1>', lambda e: on_inp_select(e, 1, p1, p2, p3, p4))
     sel1 = p1.winfo_children()[1].winfo_children()[1]
+    if readonly: modal_dlg_readonly(dlg, title)
     root.wait_window(dlg.win)
     return opt_new if dlg.ok else opt
 
 # input source select callback -------------------------------------------------
 def on_inp_select(e, sel, p1, p2, p3, p4):
+    if e.widget.instate(('disabled',)): return
     inp_opt_enable_update(sel, p1, p2, p3, p4)
 
 # update input options enable --------------------------------------------------
@@ -514,7 +571,7 @@ def ch_opt_panel_new(parent, opt):
         justify=LEFT)
     panel1 = Frame(panel, bg=BG_COLOR)
     panel1.pack(fill=X, pady=(4, 0))
-    label = 'RF       LO_MHz*  I/IQ*  Bits* LPF_MHz'
+    label = 'RF_CH  LO_MHz*  I/IQ*  Bits* LPF_MHz'
     ttk.Label(panel1, text=label).pack(side=LEFT, padx=(4, 0))
     ttk.Label(panel1, text=label).pack(side=RIGHT, padx=(0, 2))
     panel2 = Frame(panel, bg=BG_COLOR)
@@ -531,15 +588,15 @@ def ch_opt_panel_new(parent, opt):
 # generate RF channel options panel --------------------------------------------
 def rfch_opt_panel_new(parent, ch, opt):
     panel = Frame(parent, bg=BG_COLOR)
-    ttk.Label(panel, text='CH%d' % (ch + 1)).pack(side=LEFT, padx=(0, 2))
-    ttk.Entry(panel, width=3, justify=RIGHT, textvariable=opt.lpf_bw[ch],
+    ttk.Label(panel, text=' %d' % (ch + 1)).pack(side=LEFT, padx=(0, 2))
+    ttk.Entry(panel, width=4, justify=RIGHT, textvariable=opt.lpf_bw[ch],
         font=FONT).pack(side=RIGHT, padx=1)
     ttk.Combobox(panel, width=2, justify=CENTER, values=opt.bitss,
         textvariable=opt.bits[ch], font=FONT).pack(side=RIGHT, padx=1)
     ttk.Combobox(panel, width=3, justify=CENTER, values=opt.IQs,
         textvariable=opt.IQ[ch], font=FONT).pack(side=RIGHT, padx=1)
-    ttk.Entry(panel, width=9, justify=RIGHT, textvariable=opt.fo[ch],
-        font=FONT).pack(side=RIGHT, padx=1)
+    ttk.Combobox(panel, width=8, justify=RIGHT, values=F_LO, height=len(F_LO),
+        textvariable=opt.fo[ch], font=FONT).pack(side=RIGHT, padx=1)
     panel.pack(fill=X, padx=(4, 2))
     return panel
 
@@ -570,6 +627,7 @@ def rtcm3_to_rinex(status, file):
 
 # callback on button To RINEX --------------------------------------------------
 def on_to_rinex(e, path, status):
+    if e.widget.instate(('disabled',)): return
     init_dir = os.path.dirname(rep_path_time(path.split('::')[0]))
     file = filedialog.askopenfilename(parent=e.widget.master,
         title='RTCM3 File to Convert to RINEX', initialdir=init_dir,
@@ -577,34 +635,70 @@ def on_to_rinex(e, path, status):
     if file != '':
         rtcm3_to_rinex(status, file)
 
+# generate output stream panel ---------------------------------------------------
+def str_panel_new(parent, opt, i):
+    panel = Frame(parent, bg=BG_COLOR)
+    ttk.Checkbutton(panel, text='%d' % (i + 1), variable=opt.path_ena[i],
+        command=lambda: on_str_ena_change(panel, opt, i)).pack(side=LEFT)
+    panel.box = ttk.Combobox(panel, width=7, values=STR_TYPES,
+        textvariable=opt.str_type[i], justify=CENTER, font=FONT)
+    panel.box.pack(side=LEFT, padx=(2, 4))
+    p = custom_btn_new(panel, ' ... ')
+    p.panel.pack(side=RIGHT, padx=2, pady=1)
+    panel.btn = p.btn
+    panel.inp = ttk.Entry(panel, textvariable=opt.path[i], font=FONT)
+    panel.inp.pack(side=LEFT, expand=1, fill=X)
+    p.btn.bind('<Button-1>', lambda e: on_str_path_btn_push(e, panel, opt, i))
+    panel.pack(fill=X, padx=(10, 2), pady=1)
+    on_str_ena_change(panel, opt, i)
+    return panel
+
+# output stream enable change callback --------------------------------------------
+def on_str_ena_change(p, opt, i):
+    ena = opt.path_ena[i].get()
+    p.box.configure(state='readonly' if ena else DISABLED)
+    p.inp.configure(state=NORMAL if ena else DISABLED)
+    p.btn.configure(state=NORMAL if ena else DISABLED)
+
+# output stream path button push callback ----------------------------------------
+def on_str_path_btn_push(e, p, opt, i):
+    if e.widget.instate(('disabled',)): return
+    if not opt.path_ena[i].get(): return
+    types = STR_FILE_TYPES.get(opt.str_type[i].get(), [('All', '*.*')])
+    path = filedialog.asksaveasfilename(parent=p, title='Output File Path',
+        filetypes=types)
+    if path != '':
+        opt.path[i].set(path)
+
+# get first enabled RTCM3 output stream path -------------------------------------
+def rtcm3_path(opt):
+    for i in range(MAX_STR):
+        if opt.path_ena[i].get() and opt.str_type[i].get() == 'RTCM3':
+            return opt.path[i].get()
+    return ''
+
 # show Output Options dialog ---------------------------------------------------
-def out_opt_dlg(root, opt):
-    texts = ('Output Paths (File: local_path[::S=tint], TCP: [addr]:port)',
-        'PVT Solutions (NMEA 0183)', 'OBS and NAV Data (RTCM3)',
-        'Receiver Log (CSV Text)', 'IF Data Log (RAW8, RAW16 or RAW32)',
+def out_opt_dlg(root, opt, readonly=0):
+    texts = ('Output Streams (File: local_path[::S=tint], TCP: [addr]:port)',
         'Output Receiver Log Types', 'Keywords Replacement in Path',
-        '%Y=Year(yyyy) %y=year(yy) %m=month(mm) %d=day(dd)',
-        '%h=hour(00-23) %M=minute(00-59) %S=second(00-59)')
+        '%Y=Year(yyyy) %y=year(yy) %m=month(mm) %d=day(dd) %h=hour(00-23)',
+        '%M=minute(00-59) %S=second(00-59)')
     opt_new = out_opt_new(opt)
-    dlg = modal_dlg_new(root, 500, 520, 'Output Options')
+    title = 'Output Options'
+    dlg = modal_dlg_new(root, 600, 500, title)
     panel1 = Frame(dlg.panel, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     panel1.pack(fill=X, pady=2)
     ttk.Label(panel1, text=texts[0], justify=LEFT).pack(fill=X, padx=10,
-        pady=(4, 8))
-    path_panel_new(panel1, texts[1], out=1, var_path=opt_new.path[0],
-        var_ena=opt_new.path_ena[0], types=[('NMEA File', '*.nmea'), ('All', '*.*')])
-    path_panel_new(panel1, texts[2], out=1, var_path=opt_new.path[1],
-       var_ena=opt_new.path_ena[1], types=[('RTCM3 File', '*.rtcm3'), ('All', '*.*')],
-       var_extra=opt_new.array_sep, text_extra='RF CH Separation')
-    path_panel_new(panel1, texts[3], out=1, var_path=opt_new.path[2],
-       var_ena=opt_new.path_ena[2], types=[('Log File', '*.log'), ('All', '*.*')])
-    path_panel_new(panel1, texts[4], out=1, var_path=opt_new.path[3],
-       var_ena=opt_new.path_ena[3], types=[('Raw IF Log', '*.bin'), ('All', '*.*')])
+        pady=(4, 2))
+    for i in range(MAX_STR):
+        str_panel_new(panel1, opt_new, i)
+    ttk.Checkbutton(panel1, text='RF CH Separation (RTCM3)',
+        variable=opt_new.array_sep).pack(anchor=W, padx=10, pady=(2, 4))
     panel2 = Frame(dlg.panel, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     panel2.pack(fill=X, pady=2)
-    ttk.Label(panel2, text=texts[5], justify=LEFT).pack(fill=X, padx=10, pady=2)
+    ttk.Label(panel2, text=texts[1], justify=LEFT).pack(fill=X, padx=10, pady=2)
     n = len(opt_new.log_sel)
-    cols = 8
+    cols = 10
     panel3 = Frame(panel2, bg=BG_COLOR)
     panel3.pack(anchor=W, padx=6, pady=4)
     for i, (label, var) in enumerate(zip(opt_new.log, opt_new.log_sel)):
@@ -612,21 +706,23 @@ def out_opt_dlg(root, opt):
             ).grid(row=i // cols, column=i % cols, sticky=W, padx=4)
     panel4 = Frame(dlg.panel, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     panel4.pack(fill=X, pady=2)
-    ttk.Label(panel4, text=texts[6], justify=LEFT).pack(fill=X, padx=10, pady=2)
-    ttk.Label(panel4, text=texts[7], justify=LEFT).pack(fill=X, padx=26, pady=2)
-    ttk.Label(panel4, text=texts[8], justify=LEFT).pack(fill=X, padx=26, pady=(2, 8))
+    ttk.Label(panel4, text=texts[2], justify=LEFT).pack(fill=X, padx=10, pady=2)
+    ttk.Label(panel4, text=texts[3], justify=LEFT).pack(fill=X, padx=26, pady=2)
+    ttk.Label(panel4, text=texts[4], justify=LEFT).pack(fill=X, padx=26, pady=(2, 8))
     status = ttk.Label(dlg.panel, text='', foreground='blue', anchor=N)
     status.pack(fill=X, expand=1, pady=(4,12))
     btn_rnx = ttk.Button(dlg.btns, width=12, padding=(2, 2), text='To RINEX')
     btn_rnx.pack(side=LEFT, padx=1)
-    btn_rnx.bind('<Button-1>', lambda e: on_to_rinex(e, opt_new.path[1].get(), status))
+    btn_rnx.bind('<Button-1>', lambda e: on_to_rinex(e, rtcm3_path(opt_new), status))
+    if readonly: modal_dlg_readonly(dlg, title)
     root.wait_window(dlg.win)
     return opt_new if dlg.ok else opt
 
 # show Signal Options dialog ---------------------------------------------------
-def sig_opt_dlg(root, opt):
+def sig_opt_dlg(root, opt, readonly=0):
     opt_new = sig_opt_new(opt)
-    dlg = modal_dlg_new(root, 480, 600, 'Signal Options')
+    title = 'Signal Options'
+    dlg = modal_dlg_new(root, 480, 620, title)
     panel1 = Frame(dlg.panel, width=450, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     sig_panels = []
     ttk.Button(dlg.btns, width=12, padding=(2, 2), text='Set All',
@@ -645,10 +741,15 @@ def sig_opt_dlg(root, opt):
         sig_panels.append(panel)
     panel2 = Frame(dlg.panel, width=450, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     panel2.pack(fill=X, pady=2)
+    ttk.Label(panel2, text='Satellite No Assignments ([<sys>:]<sig>:<prn>[-<prn>][,...][ ...])').pack(
+        fill=X, padx=10, pady=4)
+    inp_panel_new(panel2, '', opt_new.sig_satno, width=500, justify=LEFT).pack(
+        padx=(0, 4), pady=(2, 6))
     ttk.Label(panel2, text='RF CH Assignments (<sig>:<ch>[-<ch>][,...][ ...])').pack(
         fill=X, padx=10, pady=4)
     inp_panel_new(panel2, '', opt_new.sig_rfch, width=500, justify=LEFT).pack(
         padx=(0, 4), pady=(2, 6))
+    if readonly: modal_dlg_readonly(dlg, title)
     root.wait_window(dlg.win)
     return opt_new if dlg.ok else opt
 
@@ -685,75 +786,87 @@ def sig_opt_set_all(panels, opt, state):
         on_sig_opt_change(panel, opt.sys_sel[i])
 
 # show System Options dialog ---------------------------------------------------
-def sys_opt_dlg(root, opt):
+def sys_opt_dlg(root, opt, readonly=0):
     labels = ('Epoch Interval for PVT (s)', 'Max Epoch Lag for PVT (s)',
         'Elevation Mask for PVT (\xb0)', 'Correlator Spacing (chip)',
-        'Integration Time for Acquisition (s)', 'Integration Time for DLL (s)',
-        'DLL Loop Filter Bandwidth (Hz)', 'PLL Loop Filter Bandwidth (Hz)',
-        'FLL Loop Filter Bandwidth Wide (Hz)',
-        'FLL Loop Filter Bandwidth Narrow (Hz)',
-        'Max Doppler Freq. to Search Signal (Hz)',
-        'C/N0 Threshold for Signal Locked (dB-Hz)',
-        'C/N0 Threshold for Signal Lost (dB-Hz)', 'Bump Jump for BOC Modulation',
-        'Signal Acquisition Mode',
-        'Max Code Length for direct acquisition (ms)',
-        'Carrier Lock Threshold (PLI)', 'Lost Decision Count (windows)')
+        'Integration for Acquisition (s)', 'Integration for Assisted Acq (s)',
+        'Integration for DLL (s)', 'Coherent Integration for Pilot (s)',
+        'DLL Loop Filter BW (Hz)', 'PLL Loop Filter BW (Hz)',
+        'FLL Loop Filter BW Wide (Hz)', 'FLL Loop Filter BW Narrow (Hz)',
+        'Max Doppler Freq to Search (Hz)', 'C/N0 Thres for Lock (dB-Hz)',
+        'C/N0 Thres for Assisted Acq (dB-Hz)', 'C/N0 Thres for Lost (dB-Hz)',
+        'Bump Jump for BOC Modulation', 'Signal Acquisition Mode',
+        'Max Code Len for Direct Acq (ms)', 'Carrier Lock Threshold (PLI)',
+        'Lost Decision Count (windows)')
     opt_new = sys_opt_new(opt)
-    dlg = modal_dlg_new(root, 420, 640, 'System Options')
+    title = 'System Options'
+    dlg = modal_dlg_new(root, 660, 500, title)
     ttk.Button(dlg.btns, width=12, padding=(2, 2), text='Set Default',
         command=lambda: sys_opt_set_default(opt_new)).pack(side=LEFT, padx=1)
     panel1 = Frame(dlg.panel, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     panel1.pack(fill=X, pady=2, ipady=1)
-    sel_panel_new(panel1, labels[0], sels=('0.1', '0.2', '0.5', '1.0',
-        '2.0', '5.0'), var=opt_new.epoch, width=10)
-    sel_panel_new(panel1, labels[1], sels=('0.1', '0.2', '0.3', '0.5', '0.75',
-        '1.0'), var=opt_new.lag_epoch, width=10)
-    sel_panel_new(panel1, labels[2], sels=('5', '10', '15', '20', '25',
-        '30'), var=opt_new.el_mask, width=10)
+    sel_panel_new(panel1, labels[0], sels=('0.1', '0.2', '0.5', '1.0', '2.0',
+        '5.0'), var=opt_new.epoch, width=7)
+    sel_panel_new(panel1, labels[1], sels=('0.1', '0.2', '0.5', '1.0', '2.0'),
+        var=opt_new.lag_epoch, width=7)
+    sel_panel_new(panel1, labels[2], sels=('5', '10', '15', '20', '25', '30'),
+        var=opt_new.el_mask, width=7)
     panel2 = Frame(dlg.panel, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     panel2.pack(fill=X, pady=2, ipady=1)
-    sel_panel_new(panel2, labels[3], sels=('0.05', '0.1', '0.15', '0.2', '0.25',
-        '0.5', '0.75', '1.0'), var=opt_new.sp_corr, width=10)
-    sel_panel_new(panel2, labels[4], sels=('0.005', '0.01', '0.02', '0.05',
-        '0.1', '0.2'), var=opt_new.t_acq, width=10)
-    sel_panel_new(panel2, labels[5], sels=('0.005', '0.01', '0.02', '0.05',
-        '0.1', '0.2'), var=opt_new.t_dll, width=10)
-    sel_panel_new(panel2, labels[6], sels=('0.1', '0.15', '0.2', '0.25',
-        '0.3', '0.4', '0.5', '0.75', '1.0'), var=opt_new.b_dll, width=10)
-    sel_panel_new(panel2, labels[7], sels=('1.0', '2.5', '5.0', '7.5', '10.0',
-        '15.0', '20.0'), var=opt_new.b_pll, width=10)
-    sel_panel_new(panel2, labels[8], sels=('1.0', '2.5', '5.0', '7.5', '10.0',
-        '15.0', '20.0'), var=opt_new.b_fll_w, width=10)
-    sel_panel_new(panel2, labels[9], sels=('0.5', '1.0', '2.0', '3.0', '4.0',
-        '5.0', '6.0'), var=opt_new.b_fll_n, width=10)
-    sel_panel_new(panel2, labels[10], sels=('3000', '5000', '7000', '10000',
-        '15000', '20000'), var=opt_new.max_dop, width=10)
-    sel_panel_new(panel2, labels[11], sels=('31.0', '32.0', '33.0', '34.0',
-        '35.0', '36.0', '37.0'), var=opt_new.thres_cn0_l, width=10)
-    sel_panel_new(panel2, labels[12], sels=('27.0', '28.0', '29.0', '30.0',
-        '31.0', '32.0', '33.0'), var=opt_new.thres_cn0_u, width=10)
-    sel_panel_new(panel2, labels[16], sels=('0.1', '0.15', '0.2', '0.25',
-        '0.3', '0.35', '0.4'), var=opt_new.thres_pli, width=10)
-    sel_panel_new(panel2, labels[17], sels=('1', '2', '3', '4', '5', '6'),
-        var=opt_new.lost_th, width=10)
-    sel_panel_new(panel2, labels[13], sels=('OFF', 'ON'), var=opt_new.bump_jump,
-        width=10)
-    sel_panel_new(panel2, labels[14], sels=('Full-Search', 'Fast-Search'),
-        var=opt_new.acq_mode, width=10)
-    sel_panel_new(panel2, labels[15], sels=('1.0', '2.0', '5.0', '10.0', '20.0'),
-        var=opt_new.max_acq, width=10)
+    panel2a = Frame(panel2, bg=BG_COLOR)
+    panel2a.pack(side=LEFT, expand=1, fill=BOTH)
+    panel2b = Frame(panel2, bg=BG_COLOR)
+    panel2b.pack(side=LEFT, expand=1, fill=BOTH)
+    sel_panel_new(panel2a, labels[3], sels=('0.05', '0.1', '0.15', '0.2', '0.25',
+        '0.5', '0.75', '1.0'), var=opt_new.sp_corr, width=7)
+    sel_panel_new(panel2a, labels[4], sels=('0.01', '0.02', '0.05', '0.1', '0.2'),
+        var=opt_new.t_acq, width=7)
+    sel_panel_new(panel2a, labels[5], sels=('0.01', '0.02', '0.05', '0.1', '0.2'),
+        var=opt_new.t_acq_ext, width=7)
+    sel_panel_new(panel2a, labels[6], sels=('0.005', '0.01', '0.02', '0.05',
+        '0.1', '0.2'), var=opt_new.t_dll, width=7)
+    sel_panel_new(panel2a, labels[7], sels=('0.005', '0.01', '0.02', '0.05',
+        '0.1', '0.2'), var=opt_new.t_coh, width=7)
+    sel_panel_new(panel2a, labels[8], sels=('0.1', '0.2', '0.3', '0.4', '0.5',
+        '0.75', '1.0'), var=opt_new.b_dll, width=7)
+    sel_panel_new(panel2a, labels[9], sels=('1.0', '2.5', '5.0', '7.5', '10.0',
+        '15.0', '20.0'), var=opt_new.b_pll, width=7)
+    sel_panel_new(panel2a, labels[10], sels=('1.0', '2.5', '5.0', '7.5', '10.0',
+        '15.0', '20.0'), var=opt_new.b_fll_w, width=7)
+    sel_panel_new(panel2a, labels[11], sels=('1.0', '2.5', '5.0', '7.5', '10.0',
+        '15.0', '20.0'), var=opt_new.b_fll_n, width=7)
+    sel_panel_new(panel2b, labels[12], sels=('3000', '5000', '7000', '10000',
+        '15000', '20000'), var=opt_new.max_dop, width=7)
+    sel_panel_new(panel2b, labels[13], sels=('30.0', '31.0', '32.0', '33.0',
+        '34.0', '35.0', '36.0'), var=opt_new.thres_cn0_l, width=7)
+    sel_panel_new(panel2b, labels[14], sels=('25.0', '26.0', '27.0', '28.0',
+        '29.0', '30.0', '31.0', '32.0'), var=opt_new.thres_cn0_ext, width=7)
+    sel_panel_new(panel2b, labels[15], sels=('18.0', '19.0', '20.0', '21.0', '22.0',
+        '23.0', '24.0', '25.0', '27.0', '30.0'), var=opt_new.thres_cn0_u, width=7)
+    sel_panel_new(panel2b, labels[19], sels=('0.1', '0.15', '0.2', '0.25',
+        '0.3', '0.35', '0.4'), var=opt_new.thres_pli, width=7)
+    sel_panel_new(panel2b, labels[20], sels=('1', '2', '3', '4', '5', '6'),
+        var=opt_new.lost_th, width=7)
+    sel_panel_new(panel2b, labels[16], sels=('OFF', 'ON'), var=opt_new.bump_jump,
+        width=7)
+    sel_panel_new(panel2b, labels[17], sels=('Full', 'Fast'),
+        var=opt_new.acq_mode, width=7)
+    sel_panel_new(panel2b, labels[18], sels=('1.0', '2.0', '5.0', '10.0', '20.0'),
+        var=opt_new.max_acq, width=7)
     path_panel_new(dlg.panel, 'FFTW Wisdom Path', out=0,
         var_path=opt_new.fftw_wisdom_path)
     ttk.Label(dlg.panel, text='Receiver Options').pack(fill=X, padx=10, pady=4)
     inp_panel_new(dlg.panel, '', opt_new.rcv_options, width=100, justify=LEFT).pack(
         padx=(0, 4), pady=(2, 6))
+    if readonly: modal_dlg_readonly(dlg, title)
     root.wait_window(dlg.win)
     return opt_new if dlg.ok else opt
 
 # show Array Options dialog ----------------------------------------------------
-def array_opt_dlg(root, opt, geom_load=None, geom_save=None):
+def array_opt_dlg(root, opt, geom_load=None, geom_save=None, readonly=0):
     opt_new = array_opt_new(opt)
-    dlg = modal_dlg_new(root, 420, 590, 'Array Options')
+    title = 'Array Options'
+    dlg = modal_dlg_new(root, 420, 590, title)
     sel_panel_new(dlg.panel, 'Number of Array CH',
         sels=['%d' % n for n in range(9)], var=opt_new.no_array, width=8)
     w, h, r = 380, 220, 0.135
@@ -786,12 +899,13 @@ def array_opt_dlg(root, opt, geom_load=None, geom_save=None):
         geom_save))
     btn4.bind('<Button-1>', lambda e: on_btn_clear_push(e, plot, opt_new))
     plot.c.bind('<Configure>', lambda e: on_show_ant_ele_plot(e, plot, opt_new))
+    if readonly: modal_dlg_readonly(dlg, title)
     root.wait_window(dlg.win)
     return opt_new if dlg.ok else opt
 
 # button geometry load push callback -------------------------------------------
 def on_btn_geom_load_push(e, dlg, plot, opt, geom_load):
-    if geom_load is None: return
+    if e.widget.instate(('disabled',)) or geom_load is None: return
     file = filedialog.askopenfilename(parent=dlg.win,
         title='Load Array Geometry',
         filetypes=[('Geometry', '*.geom'), ('All', '*.*')])
@@ -808,7 +922,7 @@ def on_btn_geom_load_push(e, dlg, plot, opt, geom_load):
 
 # button geometry save push callback -------------------------------------------
 def on_btn_geom_save_push(e, dlg, opt, geom_save):
-    if geom_save is None: return
+    if e.widget.instate(('disabled',)) or geom_save is None: return
     n = 0
     for i in range(MAX_RFCH):
         if opt.ena_ele[i].get(): n = i + 1
@@ -852,6 +966,7 @@ def on_btn_update_push(e, plot, opt):
 
 # button clear push callback ---------------------------------------------------
 def on_btn_clear_push(e, plot, opt):
+    if e.widget.instate(('disabled',)): return
     for ch in range(MAX_RFCH):
         opt.posx[ch].set('0.0000')
         opt.posy[ch].set('0.0000')
@@ -862,22 +977,23 @@ def on_btn_clear_push(e, plot, opt):
 def plot_ant_ele(plot, opt):
    dx = 0.05 # grid interval
    plt.plot_clear(plot)
-   color = plt.GR_COLOR
+   fcolor = plt.FG_COLOR
+   gcolor = plt.GR_COLOR
    for i in range(-6, 7):
-       plt.plot_poly(plot, [i * dx, i * dx], plot.yl, color if i else '#CCCCCC')
-       plt.plot_poly(plot, plot.xl, [i * dx, i * dx], color if i else '#CCCCCC')
-   plt.plot_circle(plot, 0, 0, 0.13, color='blue')
-   plt.plot_circle(plot, 0, 0, 0.0951, color=color)
+       plt.plot_poly(plot, [i * dx, i * dx], plot.yl, gcolor)
+       plt.plot_poly(plot, plot.xl, [i * dx, i * dx], gcolor)
+   plt.plot_circle(plot, 0, 0, 0.13, color=gcolor)
+   plt.plot_circle(plot, 0, 0, 0.0951, color=gcolor)
    for ch in range(MAX_RFCH):
       if opt.ena_ele[ch].get():
           x = float(opt.posx[ch].get())
           y = float(opt.posy[ch].get())
-          plt.plot_circle(plot, x, y, 0.022, color='blue')
-          plt.plot_text(plot, x, y, '%d' % (ch + 1), color='blue')
-   plot_ant_mark(plot, 0, plot.yl[1] - 0.01, 'blue')
+          plt.plot_circle(plot, x, y, 0.022, color=fcolor)
+          plt.plot_text(plot, x, y, '%d' % (ch + 1), color=fcolor)
+   plot_ant_mark(plot, 0, plot.yl[1] - 0.01, fcolor)
 
 # plot antenna mark ------------------------------------------------------------
 def plot_ant_mark(plot, x, y, color):
     dx, dy = (0, 0.005, -0.005, 0), (0.004, -0.004, -0.004, 0.004)
     plt.plot_poly(plot, [x + d for d in dx], [y + d for d in dy], color=color,
-        fill=1)
+        fill=color)

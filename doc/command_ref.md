@@ -1,7 +1,7 @@
 # Pocket SDR Command Reference
 
 <div style="text-align: right;">
-<strong>ver.0.17  2026-06-17</strong>
+<strong>ver.0.21  2026-10-21</strong>
 </div>
 
 ---
@@ -14,6 +14,7 @@
 - [pocket_dump](#sec-pocket_dump) - Capture digital IF data from Pocket SDR FE
 - [pocket_acq](#sec-pocket_acq) - GNSS signal acquisition from IF data
 - [pocket_trk](#sec-pocket_trk) - GNSS signal tracking, nav decoding, and PVT generation
+- [pocket_web](#sec-pocket_web) - GNSS receiver server with Web UI
 - [pocket_snap](#sec-pocket_snap) - Snapshot positioning from IF data
 - [pocket_calib](#sec-pocket_calib) - Antenna array attitude and per-CH bias calibration
 - [convbin](#sec-convbin) - Convert receiver logs / RTCM streams to RINEX
@@ -178,8 +179,8 @@ Hexadecimal form:
 
 ```
 pocket_dump [-t tsec] [-r] [-p bus[,port]] [-c conf_file] [-q] [-v]
-            [-driver name] [-fmt {CS8|CS16}] [-f fs] [-fo freq]
-            [-gain gain] [-bw bw]
+            [-driver name] [-fmt {CS8|CS16}] [-f fs] [-fo freq[,...]]
+            [-gain gain] [-bw bw] [-gpio val] [-NO_SYNC]
             [path [path ...]]
 ```
 
@@ -188,7 +189,9 @@ pocket_dump [-t tsec] [-r] [-p bus[,port]] [-c conf_file] [-q] [-v]
 Capture and dump digital IF (DIF) data from a Pocket SDR FE device or a
 SoapySDR-supported device. Pocket SDR FE capture writes one output file per RF
 channel unless `-r` is specified. SoapySDR capture writes one complex sample
-stream to the first output path. Capturing stops on the configured duration
+stream to the first output path; with multiple RF channels the channels are
+written channel-planar in blocks of a processing cycle, which `pocket_trk`
+replays as a multi-channel input. Capturing stops on the configured duration
 (`-t`), or by Ctrl-C. A `<path>.tag` companion file is written for each output,
 recording the IF format, sampling rate, LO frequencies, and per-CH sampling type
 / bit width so downstream tools (e.g. `pocket_trk`, `pocket_acq`) can
@@ -207,19 +210,34 @@ auto-configure.
 - `-driver name`
   - Use a SoapySDR device instead of a Pocket SDR FE device. Examples: `lime`,
     `uhd`, `bladerf`, `rtlsdr`, `plutosdr`. Driver-specific arguments accepted
-    by SoapySDR can also be passed.
+    by SoapySDR can also be passed. Multiple devices are specified as specs
+    separated by `;`, and `nchan=<n>` in a spec selects the number of RX
+    channels of the device (default 1), up to 8 RF channels in total.
+    With multiple devices the external clock and time sources are selected and
+    the streams are started at a common time latched by a 1PPS, so a common
+    10 MHz and 1PPS have to be distributed to the devices.
+    - `-driver "driver=uhd,serial=31A1;driver=uhd,serial=31B5"`
+    - `-driver "driver=uhd,serial=31A1,nchan=2"`
 - `-fmt {CS8|CS16}`
   - SoapySDR sample format. [`CS8`]
 - `-f fs`
   - SoapySDR sampling rate in MHz. [`12`]
-- `-fo freq`
-  - SoapySDR RF center frequency in MHz. This option is required with
-    `-driver`.
+- `-fo freq[,...]`
+  - SoapySDR RF center frequency of each RF channel in MHz. This option is
+    required with `-driver`. A channel with an omitted or `0` frequency uses
+    the frequency of the first channel.
 - `-gain gain`
   - SoapySDR RF gain in dB. Omitted or `0`: use automatic gain if the driver
     supports it.
 - `-bw bw`
   - SoapySDR RF bandwidth in MHz. Omitted or `0`: leave driver default.
+- `-gpio val`
+  - Output `val` (0-255) to the GPIO pins of the SoapySDR device (USRP:
+    front-panel GPIO). The pins are set to outputs at the device open.
+- `-NO_SYNC`
+  - With multiple SoapySDR devices, do not synchronize the device times by a
+    1PPS. The devices run on their own clocks and the RF channels of
+    different devices are NOT aligned in samples.
 - `-q`
   - Suppress the runtime status display.
 - `-v`
@@ -304,14 +322,15 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-f freq] [-fo freq[,...]] [-IQ {1|2}[,...]] [-bits {2|3}[,...]]
            [-toff toff] [-tscale scale] [-ti tint]
            [-p bus[,port]] [-c conf_file]
-           [-driver name] [-gain gain] [-bw bw] [-fd dopp]
-           [-log path] [-nmea path] [-rtcm path] [-raw path]
+           [-driver name] [-gain gain] [-bw bw] [-gpio val] [-EXT_CLOCK]
+           [-NO_SYNC] [-fd dopp] [-log path] [-nmea path] [-rtcm path] [-raw path] ...
+           [-arch nch] [-geom file] [-sens name[,...]]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
 ### Description
 
-Search and track GNSS signals in input digital IF data, extract observation data, decode navigation data, and generate PVT solutions. Observation and navigation data can be streamed as RTCM3, PVT solutions as NMEA, and raw IF data and event logs can be streamed independently.
+Search and track GNSS signals in input digital IF data, extract observation data, decode navigation data, and generate PVT solutions. Observation and navigation data can be streamed as RTCM3, PVT solutions as NMEA, and raw IF data and event logs can be streamed independently. The output stream options `-log`, `-nmea`, `-rtcm`, and `-raw` may each be specified multiple times, up to 8 output streams in total; each occurrence opens an additional stream of that type (e.g., `-nmea sol.nmea -nmea :2001` outputs NMEA to a file and a TCP server simultaneously).
 
 The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapySDR-supported device (LimeSDR, HackRF, RTL-SDR, ...). If the file path is omitted and `-driver` is not specified, the input is taken from a Pocket SDR FE device directly. For file inputs, if `<file>.tag` exists the IF format, sampling rate, LO frequencies, and per-CH sampling types are auto-configured from the tag, and the corresponding `-fmt`, `-f`, `-fo`, and `-IQ` options are ignored.
 
@@ -326,8 +345,9 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
   - Sampling frequency of the IF data in MHz. [`12.0`]
 - `-fo freq[,...]`
   - LO frequency for each RF channel in MHz, comma-separated. With
-    `RAW8/16/32`, 2/4/8 frequencies are required. With `-driver`, the first
-    frequency is the SoapySDR RF center frequency and is required.
+    `RAW8/16/32`, 2/4/8 frequencies are required. With `-driver`, these are the
+    SoapySDR RF center frequencies of the RF channels and the first one is
+    required; a channel with an omitted or `0` frequency uses the first one.
 - `-IQ {1|2}[,...]`
   - Per-RF-CH sampling type: `1` = I, `2` = IQ. Used with `RAW8/16/32`. [`2,2,2,2,2,2,2,2`]
 - `-bits {2|3}[,...]`
@@ -344,33 +364,231 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
   - Configure the Pocket SDR FE device with a `pocket_conf`-format file before tracking starts.
 - `-driver name`
   - SoapySDR driver name (`lime`, `hackrf`, `rtlsdr`, `sdrplay`, `bladerf`, ...). Selects a SoapySDR device as the input.
+    Multiple devices are specified as specs separated by `;`, and `nchan=<n>`
+    in a spec selects the number of RX channels of the device (default 1), up
+    to 8 RF channels in total. With multiple devices the external clock and
+    time sources are selected and the streams are started at a common time
+    latched by a 1PPS, so a common 10 MHz and 1PPS have to be distributed to
+    the devices. The RF channels are then handled like the RF channels of a
+    multi-CH frontend, including `-RFCH` assignment and `-arch` array
+    combining.
 - `-gain gain`
   - SoapySDR overall gain in dB.
 - `-bw bw`
   - SoapySDR analog filter bandwidth in MHz.
+- `-gpio val`
+  - Output `val` (0-255) to the GPIO pins of the SoapySDR device (USRP:
+    front-panel GPIO). The pins are set to outputs at the device open.
+- `-EXT_CLOCK`
+  - Select the external clock source of the SoapySDR device.
+- `-NO_SYNC`
+  - With multiple SoapySDR devices, do not synchronize the device times by a
+    1PPS. The devices run on their own clocks and the RF channels of
+    different devices are NOT aligned in samples (for non-coherent uses such
+    as a band per device).
 - `-fd dopp`
   - Maximum Doppler frequency to search signals in Hz. Overrides the `max_dop` key in `-opt file` if both are given. [from `-opt file` or default `5000`]
 - `-log path`
-  - Output stream path for the tracking log (observation, navigation, PVT, events). The stream path is one of:
+  - Output stream path for the tracking log (observation, navigation, PVT, events). May be specified multiple times to open multiple log streams (max 8 output streams in total including `-nmea`, `-rtcm`, and `-raw`). The stream path is one of:
     - `(1)` local file path without `:`. Time keywords (`%Y`, `%m`, `%d`, `%h`, `%M`) are expanded as in RTKLIB streams.
     - `(2)` `:port` (TCP server)
     - `(3)` `address:port` (TCP client)
 - `-nmea path`
-  - Output stream path for PVT solutions as NMEA `GNRMC`, `GNGGA`, and `GNGSV` sentences. Same path syntax as `-log`.
+  - Output stream path for PVT solutions as NMEA `GNRMC`, `GNGGA`, and `GNGSV` sentences. Same path syntax and repeatability as `-log`.
 - `-rtcm path`
-  - Output stream path for raw observations and navigation data as RTCM3.3 messages. Same path syntax as `-log`.
+  - Output stream path for raw observations and navigation data as RTCM3.3 messages. Same path syntax and repeatability as `-log`.
 - `-raw path`
-  - Output stream path for raw IF data. Same path syntax as `-log`.
+  - Output stream path for raw IF data. Same path syntax and repeatability as `-log`. Enabled only for Pocket SDR FE or SoapySDR device inputs.
+- `-arch nch`
+  - Number of antenna array channels. Array CHs are appended after the RF
+    CHs. [`0`]
+- `-geom file`
+  - Array element positions file (body-frame, `pocket_sdr.py` array
+    geometry format) applied at startup. [none]
+- `-sens name[,...]`
+  - Sensors of the RF channels of a SoapySDR device to log every 10 s as
+    `$SENS,<time>,<rfch>,<name>,<value>`, e.g. `temp`, `rssi`, `lo_locked`
+    (RF channel) or `ref_locked` (device) of a USRP. [`temp`]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`
-  - System options file. See `app/pocket_trk/pocket_trk_default.conf` for the available keys (loop bandwidths, integration times, C/N0 and carrier-lock thresholds, signal-loss debounce count, `max_acq`, array calibration / beam-forming options, etc.). [none]
+  - System options file. The recognized keys and defaults are listed below; `app/pocket_trk/pocket_trk_default.conf` provides an example profile. [none]
 - `-debug file`
   - Enable RTKLIB trace output to the given file (trace level 3).
 - `-v`
   - Print version and exit.
 - `[file]`
   - Input IF data file path. If omitted and no `-driver` is given, the input is taken from a Pocket SDR FE device. With `<file>.tag` present, format/sampling parameters are auto-configured.
+
+### System option keys
+
+The file passed with `-opt` contains `key = value` entries. Without `-opt`, the
+library defaults below are used. The shipped
+`app/pocket_trk/pocket_trk_default.conf` is an example profile; its differing
+values are shown in the last column.
+
+| Key | Meaning | Library default | Example profile |
+|---|---|---:|---:|
+| `fftw_wisdom` | FFTW wisdom file path (handled by `pocket_trk`) | none | none |
+| `epoch` | PVT epoch interval (s) | `1.0` | `1.0` |
+| `lag_epoch` | Maximum PVT epoch lag (s) | `0.5` | `0.5` |
+| `el_mask` | PVT elevation mask (deg) | `15` | `15` |
+| `sp_corr` | Early/late correlator spacing (chip) | `0.25` | `0.2` |
+| `t_acq` | Normal-acquisition integration time (s) | `0.02` | `0.02` |
+| `t_acq_ext` | Doppler-assisted acquisition integration time (s) | `0.10` | `0.10` |
+| `t_coh` | Requested synchronized-pilot PLL coherent interval (s) | `0.02` | `0.02` |
+| `t_dll` | DLL integration time (s) | `0.02` | `0.02` |
+| `b_dll` | DLL bandwidth (Hz) | `0.25` | `0.5` |
+| `b_pll` | PLL bandwidth (Hz) | `5.0` | `10.0` |
+| `b_fll_w` | Wide FLL bandwidth (Hz) | `5.0` | `10.0` |
+| `b_fll_n` | Narrow FLL bandwidth (Hz) | `2.0` | `5.0` |
+| `max_dop` | Acquisition Doppler limit (Hz) | `5000` | `10000` |
+| `thres_cn0_l` | Normal-acquisition lock threshold (dB-Hz) | `34.0` | `34.0` |
+| `thres_cn0_ext` | Assisted-acquisition threshold floor (dB-Hz) | `30.0` | `30.0` |
+| `thres_cn0_u` | Normal tracking-loss threshold (dB-Hz) | `25.0` | `25.0` |
+| `thres_pli` | Carrier-lock indicator threshold | `0.25` | `0.25` |
+| `lost_th` | Consecutive bad 0.5 s windows before loss | `4` | `4` |
+| `bump_jump` | Enable BOC bump-jump (`0`/`1`) | `0` | `1` |
+| `max_acq` | Longest code period for unassisted scheduling (ms) | `4.0` | `4.0` |
+| `fast_acq` | Enable fast acquisition (`0`/`1`) | `0` | `0` |
+
+Assisted acquisition uses the larger of `thres_cn0_ext` and the applicable
+tracking-loss threshold plus 1 dB. L6 tracking uses an internal `32.5 dB-Hz`
+loss threshold instead of `thres_cn0_u`. Pilot coherent integration starts only
+after secondary-code synchronization; it falls back to per-code-period Costas
+updates if synchronization is lost or `b_pll * K * T >= 0.4`, where
+`K = max(1, round(t_coh / T))`.
+
+`fast_acq = 1` enables fast acquisition: satellite visibility and Doppler are
+predicted at the receiver time from the navigation data, almanac, and last FIX
+position saved in `.pocket_navdata.csv`, and satellites predicted below the
+horizon are skipped. The receiver time is unknown at start, so the signals are
+acquired by the full search until the TOW and the week number of a received
+signal set the receiver time (receiver sync mode `COARSE`, then `FINE` after
+the first PVT fix, logged as `$LOG ... RECEIVER SYNC`). The prediction does not
+use the host PC clock, so it also works for IF data recorded at a different
+time and for a GNSS simulator. The last FIX position is inherited regardless of
+its time.
+
+All numeric keys other than `fftw_wisdom` are passed to `sdr_rcv_setopt()`.
+
+
+<div class="pagebreak"></div>
+<a id="sec-pocket_web"></a>
+
+## pocket_web - GNSS receiver server with Web UI
+
+---
+<br>
+
+### Synopsis
+
+```
+pocket_web [-web [addr:]port] [-html dir] [-ini file] [-start]
+           [-debug file] [-v]
+```
+
+### Description
+
+Run a GNSS receiver as a server controlled from a Web UI in a browser. Static Web UI files are served over HTTP, and commands and monitor data are exchanged over WebSocket (see `doc/design_web_ui.md`). The receiver itself provides the same signal tracking, navigation data decoding, and PVT generation as `pocket_trk`.
+
+The AP does not start the receiver by itself unless `-start` is given. The input source, output streams, signal selection, and system options are all set from the Web UI, and the receiver is started and stopped from there. The settings are restored from `-ini file` at startup and saved when the receiver is stopped and when the AP exits, so a session continues where the previous one left off. The AP prints no runtime status of its own; the receiver is monitored from the Web UI.
+
+The acquisition mode `Fast` of the Web UI (receiver option `-FAST_SRCH`, also selectable in `pocket_sdr.py` and by the `fast_acq` system option key of `pocket_trk`) predicts satellite visibility and Doppler at the receiver time from the navigation data, almanac, and last fix position saved in `.pocket_navdata.csv`. Until the TOW and the week number of a received signal set the receiver time, the signals are acquired by the full search as in the `Full` mode.
+
+### Options ([]: default)
+
+- `-web [addr:]port`
+  - TCP port of the Web UI server, and optionally the bind address. The
+    address defaults to `127.0.0.1` (loopback only); specify `0.0.0.0:port`
+    to accept LAN clients. The interface is unauthenticated - do not expose
+    it to untrusted networks. Required.
+- `-html dir`
+  - Document root of the Web UI files. [`<exe_dir>/../html`]
+- `-ini file`
+  - Settings file for the receiver configuration and the system options.
+    [`pocket_web.ini`]
+- `-start`
+  - Start the receiver at startup with the restored settings, as the Start
+    command of the Web UI does. On error the AP keeps running so that the
+    settings can be fixed and the receiver started from the Web UI.
+    [start stopped]
+- `-debug file`
+  - Enable RTKLIB trace output to the given file (trace level 3).
+- `-v`
+  - Print the version and exit.
+
+### Example
+
+```
+pocket_web -web 0.0.0.0:8080
+```
+
+`run_sdr.sh` in the top directory starts and stops the server. On MSYS2 it
+stops it with SIGQUIT, which reaches a native Windows process as
+CTRL_BREAK_EVENT; a plain `kill` is `TerminateProcess()` and would leave the
+RF frontend streaming, which needs a USB reset to recover.
+
+### HTTPS with a Reverse Proxy (reference)
+
+The Web UI has neither TLS nor authentication of its own. For access outside
+a trusted LAN, keep `pocket_web` bound to loopback and put a reverse proxy in
+front of it. The proxy only has to forward the WebSocket upgrade; everything
+else is plain HTTP proxying.
+
+```
+pocket_web -web 8080          # loopback only; the proxy is the only client
+```
+
+Caddy [1] issues and renews the certificate itself and forwards WebSockets
+without extra configuration:
+
+```
+sdr.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+nginx [2] needs the upgrade headers passed through explicitly:
+
+```
+server {
+    listen 443 ssl;
+    server_name sdr.example.com;
+    ssl_certificate     /etc/letsencrypt/live/sdr.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/sdr.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       $host;
+        proxy_read_timeout 3600s;   # the monitor WebSocket is long-lived
+    }
+}
+```
+
+Notes:
+
+- Add authentication at the proxy (`auth_basic` for nginx, `basic_auth` for
+  Caddy). TLS alone only hides the traffic; anyone reaching the proxy can
+  still start, stop and reconfigure the receiver.
+- `proxy_read_timeout` has to outlast an idle WebSocket. The default 60 s is
+  enough while a page pushes data, but a client sitting on a page with no
+  subscription would be disconnected.
+- The browser upgrades to `wss:` by itself, since the Web UI derives the
+  WebSocket scheme from the page URL. No option change is needed.
+- A public certificate needs a public domain name. On a closed LAN, use a
+  local CA instead, such as Caddy's internal CA (`tls internal`) or
+  mkcert [3]; certbot [4] is the usual client for public certificates.
+
+References:
+
+- [1] Caddy, reverse_proxy directive, https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+- [2] NGINX, WebSocket proxying, https://nginx.org/en/docs/http/websocket.html
+- [3] mkcert, locally-trusted development certificates, https://github.com/FiloSottile/mkcert
+- [4] certbot, https://certbot.eff.org/
 
 
 <div class="pagebreak"></div>

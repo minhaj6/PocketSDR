@@ -20,6 +20,24 @@
 //  2025-11-19  1.12 improve carrier-phase coherency
 //  2026-05-02  1.13 support E5 AltBOC
 //  2026-06-15  1.14 update loss-of-lock detection logic
+//  2026-07-05  1.15 use fused mix carrier and standard correlator
+//  2026-07-05  1.16 support sdr_corr_fft() API change
+//                   optimize CSK() peak search and buffer usage
+//  2026-07-05  1.17 use standard correlator for L6D/E EPL correlations
+//  2026-07-05  1.18 decode L6 CSK by chip-domain FFT correlation
+//  2026-07-05  1.19 fix polarity of L6D/E EPL correlations
+//  2026-07-05  1.20 narrow CSK peak search range after L6 frame sync
+//  2026-07-08  1.21 support sdr_corr_std() API change for int8 code values
+//  2026-07-08  1.22 E5 AltBOC SSB sub-carriers: -1/+1 square -> 4-level stairs
+//                   support sdr_corr_std_cpx_code() API change
+//  2026-07-14  1.23 fix E5ABQ bank selection for correlation windows straddling
+//                   the code-cycle boundary (sec-code chip pairs differ)
+//  2026-07-17  1.24 correlate E5 AltBOC sidebands separately with real code
+//                   banks and combine them after correlation
+//                   support sdr_corr_std() API change
+//  2026-07-19  1.25 add pre-combined E5ABQ replicas (a+b, a-b) to correlate
+//                   both sidebands in one pass once the polarity is calibrated
+//  2026-07-19  1.26 improve low-C/N0 acquisition and pilot tracking
 //
 #include <ctype.h>
 #include <math.h>
@@ -28,6 +46,8 @@
 // constants and macros --------------------------------------------------------
 #define SP_CORR    0.25     // correlator spacing (chip)
 #define T_ACQ      0.02     // non-coherent integration time for acquisition (s)
+#define T_ACQ_EXT  0.10     // integration time for assisted acquisition (s)
+#define T_COH      0.02     // coherent integration time for pilot PLL (s)
 #define T_DLL      0.02     // non-coherent integration time for DLL (s)
 #define T_CN0      0.5      // averaging time for C/N0 (s)
 #define T_FPULLIN  1.0      // frequency pull-in time (s)
@@ -39,8 +59,9 @@
 #define B_FLL_N    2.0      // band-width of FLL filter (Hz) (narrow)
 #define MAX_DOP    5000.0   // max Doppler for acquisition (Hz)
 #define THRES_CN0_L 34.0    // C/N0 threshold (dB-Hz) (lock)
-#define THRES_CN0_U 30.0    // C/N0 threshold (dB-Hz) (lost)
-#define THRES_CN0_L6 33.0   // C/N0 threshold (dB-Hz) (L6D/E lost)
+#define THRES_CN0_U 25.0    // C/N0 threshold (dB-Hz) (lost)
+#define THRES_CN0_EXT 30.0  // C/N0 threshold (dB-Hz) (assisted acquisition)
+#define THRES_CN0_L6 32.5   // C/N0 threshold (dB-Hz) (L6D/E lost)
 #define THRES_PLI  0.25     // carrier lock detector threshold (cos 2*phi)
 #define LOST_TH    4        // lost decision count (C/N0/PLI windows of T_CN0)
 #define THRES_SYNC 0.02     // threshold for sec-code sync
@@ -50,6 +71,8 @@
 #define FILT_CN0   0.5      // filter parameter for C/N0
 #define BUMP_K     1.3      // bump-jump threshold
 #define ACQ_INT    10       // acquisition interval (ms)
+#define CSK_WIN    280      // L6 CSK correlation window margin (chips)
+#define CSK_NFFT   10800    // L6 CSK chip-domain FFT size (>= 10230 + 2 * CSK_WIN)
 
 #define DPI        (2.0 * PI)
 #define SQR(x)     ((x) * (x))
@@ -60,6 +83,8 @@
 // global variables ------------------------------------------------------------
 double sdr_sp_corr = SP_CORR;
 double sdr_t_acq   = T_ACQ;
+double sdr_t_acq_ext = T_ACQ_EXT;
+double sdr_t_coh   = T_COH;
 double sdr_t_dll   = T_DLL;
 double sdr_b_dll   = B_DLL;
 double sdr_b_pll   = B_PLL;
@@ -68,6 +93,7 @@ double sdr_b_fll_n = B_FLL_N;
 double sdr_max_dop = MAX_DOP;
 double sdr_thres_cn0_l = THRES_CN0_L;
 double sdr_thres_cn0_u = THRES_CN0_U;
+double sdr_thres_cn0_ext = THRES_CN0_EXT;
 double sdr_thres_pli = THRES_PLI; // carrier lock detector threshold
 int sdr_lost_th = LOST_TH; // lost decision count
 int sdr_bump_jump = 0;
@@ -85,11 +111,11 @@ static void sig_upper(const char *sig, char *Sig)
     Sig[i] = '\0';
 }
 
-// generate E5a-Q × SC_E5aI chip pattern (4× chip rate) ------------------------
+// generate E5a-Q × SC_E5aI chip pattern (AltBOC 4-level stairs, 4× chip rate) -
 static int gen_e5aq_chip(int prn, int8_t **code_I, int8_t **code_Q, int *N)
 {
-    static const int8_t SC_E5aI_I[] = { 1, -1,  1, -1, -1,  1, -1,  1};
-    static const int8_t SC_E5aI_Q[] = {-1,  1,  1, -1,  1, -1, -1,  1};
+    static const int8_t SC_E5aI_I[] = { 11, -27,  27, -11, -11,  27, -27,  11};
+    static const int8_t SC_E5aI_Q[] = {-27,  11,  11, -27,  27, -11, -11,  27};
     int n;
     int8_t *c = sdr_gen_code("E5AQ", prn, &n);
     if (!c) return 0;
@@ -106,11 +132,11 @@ static int gen_e5aq_chip(int prn, int8_t **code_I, int8_t **code_Q, int *N)
     return 1;
 }
 
-// generate E5b-Q × SC_E5bI chip pattern (4× chip rate) ------------------------
+// generate E5b-Q × SC_E5bI chip pattern (AltBOC 4-level stairs, 4× chip rate) -
 static int gen_e5bq_chip(int prn, int8_t **code_I, int8_t **code_Q, int *N)
 {
-    static const int8_t SC_E5bI_I[] = { 1, -1,  1, -1, -1,  1, -1,  1};
-    static const int8_t SC_E5bI_Q[] = { 1, -1, -1,  1, -1,  1,  1, -1};
+    static const int8_t SC_E5bI_I[] = { 11, -27,  27, -11, -11,  27, -27,  11};
+    static const int8_t SC_E5bI_Q[] = { 27, -11, -11,  27, -27,  11,  11, -27};
     int n;
     int8_t *c = sdr_gen_code("E5BQ", prn, &n);
     if (!c) return 0;
@@ -140,52 +166,126 @@ static void gen_e5abq_code_fft(int prn, double T, double fs, int N,
     }
 }
 
-// E5ABQ tracking banks --------------------------------------------------------
-static sdr_cpx16_t *gen_e5abq_banks(int prn, double T, double fs, int N)
+// E5ABQ tracking code banks (aI,aQ,bI,bQ,pI,pQ,mI,mQ; a=E5aQ*SC_E5aI,
+// b=E5bQ*SC_E5bI, p=a+b, m=a-b: p/m are the pre-combined sideband replicas) ----
+static void gen_e5abq_banks(int prn, double T, double fs, int N, int8_t *code)
 {
-    int n_banks = 3;
-    sdr_cpx16_t *banks = (sdr_cpx16_t *)sdr_malloc(sizeof(sdr_cpx16_t) * N *
-        SDR_N_CODES * n_banks);
-    int8_t *Ia, *Qa, *Ib, *Qb;
-    int n_a = 0, n_b = 0;
-    if (!gen_e5aq_chip(prn, &Ia, &Qa, &n_a)) return banks;
-    if (!gen_e5bq_chip(prn, &Ib, &Qb, &n_b)) {
-        sdr_free(Ia); sdr_free(Qa);
-        return banks;
+    int8_t *I[2], *Q[2];
+    int len[2];
+    if (!gen_e5aq_chip(prn, &I[0], &Q[0], &len[0])) return;
+    if (!gen_e5bq_chip(prn, &I[1], &Q[1], &len[1])) {
+        sdr_free(I[0]); sdr_free(Q[0]);
+        return;
     }
-    sdr_cpx16_t *buf_b = (sdr_cpx16_t *)sdr_malloc(sizeof(sdr_cpx16_t) * N);
-    
-    for (int i = 0; i < SDR_N_CODES; i++) {
-        double coff = -i / fs / SDR_N_CODES;
-        sdr_cpx16_t *p0 = banks + (0 * SDR_N_CODES + i) * N;
-        sdr_cpx16_t *p1 = banks + (1 * SDR_N_CODES + i) * N;
-        sdr_cpx16_t *p2 = banks + (2 * SDR_N_CODES + i) * N;
-        sdr_res_code(Ia, Qa, n_a, T, coff, fs, N, 0, p0); // bank1: E5aQ*SC_E5aI
-        sdr_res_code(Ib, Qb, n_b, T, coff - sdr_e5ab_off, fs, N, 0, buf_b);
-        
-        // bank2: E5aQ*SC_E5aI+E5bQ+SC_E5bI, bank3: E5aQ*SC_E5aI-E5bQ*SC_E5bI
-        for (int s = 0; s < N; s++) {
-            p1[s].I = (int8_t)SIGN(p0[s].I - buf_b[s].I);
-            p1[s].Q = (int8_t)SIGN(p0[s].Q - buf_b[s].Q);
-            p2[s].I = (int8_t)SIGN(p0[s].I + buf_b[s].I);
-            p2[s].Q = (int8_t)SIGN(p0[s].Q + buf_b[s].Q);
+    sdr_cpx16_t *tmp = (sdr_cpx16_t *)sdr_malloc(sizeof(sdr_cpx16_t) * N);
+
+    for (int m = 0; m < 2; m++) { // m=0:a, m=1:b (E5b-E5a group-delay applied)
+        for (int k = 0; k < SDR_N_CODES; k++) {
+            double coff = -k / fs / SDR_N_CODES - (m ? sdr_e5ab_off : 0.0);
+            int8_t *pI = code + ((m * 2    ) * SDR_N_CODES + k) * N;
+            int8_t *pQ = code + ((m * 2 + 1) * SDR_N_CODES + k) * N;
+            sdr_res_code(I[m], Q[m], len[m], T, coff, fs, N, 0, tmp);
+            for (int s = 0; s < N; s++) {
+                pI[s] = tmp[s].I;
+                pQ[s] = tmp[s].Q;
+            }
         }
     }
-    sdr_free(buf_b);
-    sdr_free(Ia); sdr_free(Qa); sdr_free(Ib); sdr_free(Qb);
-    return banks;
+    // pre-combined replicas: bank 4,5 = a+b (k=+1), bank 6,7 = a-b (k=-1)
+    for (int k = 0; k < SDR_N_CODES; k++) {
+        const int8_t *aI = code + (0 * SDR_N_CODES + k) * N;
+        const int8_t *aQ = code + (1 * SDR_N_CODES + k) * N;
+        const int8_t *bI = code + (2 * SDR_N_CODES + k) * N;
+        const int8_t *bQ = code + (3 * SDR_N_CODES + k) * N;
+        int8_t *pI = code + (4 * SDR_N_CODES + k) * N;
+        int8_t *pQ = code + (5 * SDR_N_CODES + k) * N;
+        int8_t *mI = code + (6 * SDR_N_CODES + k) * N;
+        int8_t *mQ = code + (7 * SDR_N_CODES + k) * N;
+        for (int s = 0; s < N; s++) { // |a|,|b| <= SDR_ALTBOC_SCALE: fits int8
+            pI[s] = (int8_t)(aI[s] + bI[s]);
+            pQ[s] = (int8_t)(aQ[s] + bQ[s]);
+            mI[s] = (int8_t)(aI[s] - bI[s]);
+            mQ[s] = (int8_t)(aQ[s] - bQ[s]);
+        }
+    }
+    sdr_free(tmp);
+    sdr_free(I[0]); sdr_free(Q[0]); sdr_free(I[1]); sdr_free(Q[1]);
 }
 
-// Select E5ABQ bank -----------------------------------------------------------
-static const sdr_cpx16_t *select_e5abq_bank(sdr_ch_t *ch)
+// calibrate E5ABQ sideband combination polarity by voting stronger combination -
+static void cal_e5abq_pol(sdr_ch_t *ch, const sdr_cpx_t *C1a,
+    const sdr_cpx_t *C1b, int sig1, int sig2)
 {
-    if (ch->trk->sec_sync <= 0) {
-        return ch->trk->code; // bank 1
+    sdr_trk_t *trk = ch->trk;
+
+    for (int part = 0; part < 2; part++) {
+        double dot = C1a[part][0] * C1b[part][0] + C1a[part][1] * C1b[part][1];
+        double pwr = SQR(C1a[part][0]) + SQR(C1a[part][1]) +
+            SQR(C1b[part][0]) + SQR(C1b[part][1]);
+        if (pwr <= 0.0) continue;
+        // |Ca+s*Cb|^2 - |Ca-s*Cb|^2 = 4*s*dot (confidence-weighted vote)
+        trk->e5b_score += 2.0 * (part ? sig2 : sig1) * dot / pwr;
     }
+    if (++trk->e5b_cnt >= 64) {
+        trk->e5b_pol = trk->e5b_score < 0.0 ? -1 : 1;
+        sdr_log(4, "$LOG,%.3f,%s,%d,E5B POL %+d (%.1f)", ch->time, ch->sig,
+            ch->prn, trk->e5b_pol, trk->e5b_score);
+    }
+}
+
+// mix carrier and correlate E5 AltBOC sidebands (a,b) and combine them ---------
+static void corr_e5abq(sdr_ch_t *ch, const sdr_buff_t *buff, int ix, double fc,
+    sdr_cpx_t *C1)
+{
+    sdr_trk_t *trk = ch->trk;
+    sdr_cpx_t Ca[SDR_MAX_CORR], Cb[SDR_MAX_CORR], C1a[2], C1b[2];
+    int n = trk->npos + trk->nposx, NB = ch->N * SDR_N_CODES;
+    int NS = (ch->N + 1) * SDR_N_CODES;
+    double coff = ch->coff * ch->fs;
+
+    if (trk->sec_sync <= 0) { // E5aQ sideband only until sec-code sync
+        sdr_corr_std(buff, ix, ch->N, ch->fs, fc, ch->phi, trk->code,
+            trk->code_sum, trk->code + NB, trk->code_sum + NS,
+            SDR_ALTBOC_SCALE, coff, trk->pos, n, 0, trk->C, C1);
+        return;
+    }
+    // sec-code chip pairs for window parts split by the code-cycle boundary
     int N1 = ch->len_sec_code, N2 = ch->len_sec_code2;
-    int idx = (ch->lock - ch->trk->sec_sync + N1) % N1;
-    int bank = ch->sec_code[idx] * ch->sec_code2[idx%N2] > 0 ? 1 : 2; // bank 2/3
-    return ch->trk->code + bank * ch->N * SDR_N_CODES;
+    int idx = (ch->lock - trk->sec_sync + N1) % N1, idx2 = (idx + 1) % N1;
+    int sa1 = ch->sec_code[idx], sa2 = ch->sec_code[idx2];
+    int sb1 = ch->sec_code2[idx % N2], sb2 = ch->sec_code2[idx2 % N2];
+
+    if (trk->e5b_pol) { // calibrated: one correlation with pre-combined replica
+        int j1 = trk->e5b_pol * sa1 * sb1 > 0 ? 4 : 6; // bank a+b or a-b
+        int j2 = trk->e5b_pol * sa2 * sb2 > 0 ? 4 : 6; // after the wrap-around
+        sdr_corr_std2(buff, ix, ch->N, ch->fs, fc, ch->phi,
+            trk->code + NB * j1, trk->code_sum + NS * j1,
+            trk->code + NB * (j1 + 1), trk->code_sum + NS * (j1 + 1),
+            trk->code + NB * j2, trk->code_sum + NS * j2,
+            trk->code + NB * (j2 + 1), trk->code_sum + NS * (j2 + 1),
+            SDR_ALTBOC_SCALE * 2, coff, trk->pos, n, sa1 * sa2, trk->C, C1);
+        return;
+    }
+    int pol = trk->e5b_score < 0.0 ? -1 : 1; // running estimate while calib.
+
+    sdr_corr_std(buff, ix, ch->N, ch->fs, fc, ch->phi, trk->code,
+        trk->code_sum, trk->code + NB, trk->code_sum + NS, SDR_ALTBOC_SCALE,
+        coff, trk->pos, n, sa1 * sa2, Ca, C1a);
+    sdr_corr_std(buff, ix, ch->N, ch->fs, fc, ch->phi, trk->code + NB * 2,
+        trk->code_sum + NS * 2, trk->code + NB * 3, trk->code_sum + NS * 3,
+        SDR_ALTBOC_SCALE, coff, trk->pos, n, sb1 * sb2, Cb, C1b);
+
+    // combine sidebands (C = (Ca + pol * sec_a * sec_b * Cb) / 2)
+    int k1 = pol * sa1 * sb1, k2 = pol * sa2 * sb2;
+    for (int i = 0; i < n; i++) {
+        trk->C[i][0] = (Ca[i][0] + k1 * Cb[i][0]) * 0.5f;
+        trk->C[i][1] = (Ca[i][1] + k1 * Cb[i][1]) * 0.5f;
+    }
+    for (int i = 0; i < 2; i++) {
+        C1[0][i] = (C1a[0][i] + k1 * C1b[0][i]) * 0.5f;
+        C1[1][i] = (C1a[1][i] + k2 * C1b[1][i]) * 0.5f;
+    }
+    cal_e5abq_pol(ch, C1a, C1b, sa1 * sb1, sa2 * sb2);
 }
 
 // new signal acquisition ------------------------------------------------------
@@ -201,6 +301,7 @@ static sdr_acq_t *acq_new(const char *sig, int prn, const int8_t *code,
         sdr_gen_code_fft(code, NULL, len_code, T, 0.0, fs, N, N, acq->code_fft);
     }
     acq->fd_ext = 0.0;
+    acq->fd_ext_valid = 0;
     acq->fds = sdr_dop_bins(T, 0.0f, (float)sdr_max_dop, &acq->len_fds);
     acq->P_sum = NULL;
     acq->n_sum = 0;
@@ -215,6 +316,26 @@ static void acq_free(sdr_acq_t *acq)
     sdr_free(acq->fds);
     sdr_free(acq->P_sum);
     sdr_free(acq);
+}
+
+// generate L6 CSK code FFT in chip-domain (see CSK()) ---------------------------
+static void gen_csk_code_fft(const int8_t *code, int len_code, int slot,
+    sdr_cpx_t *code_fft)
+{
+    int L = len_code / 2, W = CSK_WIN, M = CSK_NFFT;
+    sdr_cpx_t *cpx = sdr_cpx_malloc(M);
+
+    // code chips periodically extended by +-W chips and zero-padded
+    memset(cpx, 0, sizeof(sdr_cpx_t) * M);
+    for (int i = 0; i < L + 2 * W; i++) {
+        cpx[i][0] = (float)code[((i - W + L) % L) * 2 + slot];
+    }
+    if (sdr_cpx_fft(cpx, M, SDR_FFT_FORWARD, code_fft)) {
+        for (int i = 0; i < M; i++) {
+            code_fft[i][1] = -code_fft[i][1]; // complex conjugate
+        }
+    }
+    sdr_cpx_free(cpx);
 }
 
 // new signal tracking ---------------------------------------------------------
@@ -245,32 +366,50 @@ static sdr_trk_t *trk_new(const char *sig, int prn, const int8_t *code,
     
     trk->nposx = 0;
     trk->sec_sync = trk->sec_pol = 0;
+    trk->csk_ref = -1;
     trk->err_phas = trk->err_code = 0.0;
     trk->phas_acc = trk->code_int = 0.0;
-    trk->sumP = trk->sumN = trk->sumVE = trk->sumVL = trk->sumD = 0.0;
+    trk->sumP = trk->sumN = trk->sumVE = trk->sumVL = 0.0;
+    trk->sumPs = trk->sumD = 0.0;
+    trk->Cs[0] = trk->Cs[1] = 0.0f;
+    trk->coh_n = 0;
     memset(trk->sumC, 0, sizeof(double) * SDR_MAX_CORR);
     memset(trk->sumI, 0, sizeof(double) * SDR_MAX_CORR);
     memset(trk->aveP, 0, sizeof(double) * SDR_MAX_CORR);
     memset(trk->aveI, 0, sizeof(double) * SDR_MAX_CORR);
     int N = (int)(fs * T);
     if (!strcmp(sig, "L6D") || !strcmp(sig, "L6E")) {
-        trk->code_fft = sdr_cpx_malloc(N * SDR_N_CODES);
-        for (int i = 0; i < SDR_N_CODES; i++) {
-            double coff = -i / fs / SDR_N_CODES;
-            sdr_gen_code_fft(code, NULL, len_code, T, coff, fs, N, 0,
-                trk->code_fft + i * N);
-        }
-    } else if (!strcmp(sig, "E5ABQ")) {
-        trk->code = gen_e5abq_banks(prn, T, fs, N);
+        trk->code_fft = sdr_cpx_malloc(CSK_NFFT);
+        gen_csk_code_fft(code, len_code, !strcmp(sig, "L6E") ? 1 : 0,
+            trk->code_fft);
+    }
+    int nb = !strcmp(sig, "E5ABQ") ? 8 : 1; // number of code banks
+    trk->code = (int8_t *)sdr_malloc(sizeof(int8_t) * N * SDR_N_CODES * nb);
+    if (nb == 8) {
+        gen_e5abq_banks(prn, T, fs, N, trk->code);
     } else {
-        trk->code = (sdr_cpx16_t *)sdr_malloc(sizeof(sdr_cpx16_t) * N *
-            SDR_N_CODES);
+        sdr_cpx16_t *tmp = (sdr_cpx16_t *)sdr_malloc(sizeof(sdr_cpx16_t) * N);
         for (int i = 0; i < SDR_N_CODES; i++) {
             double coff = -i / fs / SDR_N_CODES;
-            sdr_cpx16_t *p = trk->code + i * N;
-            sdr_res_code(code, NULL, len_code, T, coff, fs, N, 0, p);
+            int8_t *p = trk->code + i * N;
+            sdr_res_code(code, NULL, len_code, T, coff, fs, N, 0, tmp);
+            for (int s = 0; s < N; s++) {
+                p[s] = tmp[s].I;
+            }
+        }
+        sdr_free(tmp);
+    }
+    // prefix sums of code banks (bias correction in sdr_corr_std())
+    trk->code_sum = (int32_t *)sdr_malloc(sizeof(int32_t) * (N + 1) *
+        SDR_N_CODES * nb);
+    for (int i = 0; i < SDR_N_CODES * nb; i++) {
+        const int8_t *p = trk->code + i * N;
+        int32_t *cs = trk->code_sum + i * (N + 1);
+        for (int s = 0; s < N; s++) {
+            cs[s+1] = cs[s] + p[s];
         }
     }
+    trk->code_scale = sdr_code_scale(sig);
     return trk;
 }
 
@@ -279,6 +418,7 @@ static void trk_free(sdr_trk_t *trk)
 {
     if (!trk) return;
     sdr_free(trk->code);
+    sdr_free(trk->code_sum);
     sdr_cpx_free(trk->code_fft);
     sdr_free(trk);
 }
@@ -324,15 +464,13 @@ sdr_ch_t *sdr_ch_new(const char *sig, int prn, double fs, double fi)
     ch->fd = ch->coff = ch->phi = ch->adr = ch->cn0 = ch->pli = 0.0;
     ch->lock = ch->lost = ch->lost_cnt = ch->pli_valid = 0;
     ch->costas = strcmp(ch->sig, "L6D") && strcmp(ch->sig, "L6E");
+    ch->pilot = sdr_sig_pilot(ch->sig);
     ch->obs_idx = -1;
     ch->acq = acq_new(ch->sig, ch->prn, ch->code, ch->len_code, ch->T, fs,
         ch->N);
     ch->trk = trk_new(ch->sig, ch->prn, ch->code, ch->len_code, ch->T, fs);
     ch->nav = sdr_nav_new();
     ch->data = (sdr_cpx16_t *)sdr_malloc(sizeof(sdr_cpx16_t) * ch->N);
-    if (!strcmp(ch->sig, "L6D") || !strcmp(ch->sig, "L6E")) {
-        ch->corr = sdr_cpx_malloc(ch->N);
-    }
     sdr_mutex_init(&ch->mtx);
     return ch;
 }
@@ -363,7 +501,11 @@ static void trk_init(sdr_trk_t *trk)
     trk->err_phas = trk->err_code = 0.0;
     trk->phas_acc = trk->code_int = 0.0;
     trk->sec_sync = trk->sec_pol = 0;
-    trk->sumP = trk->sumN = trk->sumVE = trk->sumVL = trk->sumD = 0.0;
+    trk->csk_ref = -1;
+    trk->sumP = trk->sumN = trk->sumVE = trk->sumVL = 0.0;
+    trk->sumPs = trk->sumD = 0.0;
+    trk->Cs[0] = trk->Cs[1] = 0.0f;
+    trk->coh_n = 0;
     memset(trk->C, 0, sizeof(sdr_cpx_t) * SDR_MAX_CORR);
     trk->C0[0] = trk->C0[1] = trk->C1[0] = trk->C1[1] = 0.0;
     memset(trk->P, 0, sizeof(sdr_cpx_t) * SDR_N_HIST);
@@ -371,6 +513,21 @@ static void trk_init(sdr_trk_t *trk)
     memset(trk->sumI, 0, sizeof(double) * SDR_MAX_CORR);
     memset(trk->aveP, 0, sizeof(double) * SDR_MAX_CORR);
     memset(trk->aveI, 0, sizeof(double) * SDR_MAX_CORR);
+}
+
+// initial carrier NCO phase ----------------------------------------------------
+static double init_phi(double fi, double time)
+{
+    // phi = frac(fi * time) on the common receiver time origin to cancel the
+    // start-time dependent fractional carrier phase bias between CHs
+    // (time = cycle count * SDR_CYC; split the product to avoid precision
+    // loss for large time)
+    int64_t n = (int64_t)floor(time / SDR_CYC + 0.5);
+    int64_t s = n / 1000, r = n % 1000;
+    int64_t k = ((int64_t)floor(fi) * r) % 1000; // floor(fi) * s: integer
+    double fi_f = fi - floor(fi);
+    double phi = fi_f * s + (fi_f * r + k) * 1e-3;
+    return phi - floor(phi);
 }
 
 // start tracking --------------------------------------------------------------
@@ -382,7 +539,8 @@ static void start_track(sdr_ch_t *ch, double time, double fd, double coff,
     ch->lock = 0;
     ch->fd = fd;
     ch->coff = coff;
-    ch->phi = ch->adr = 0.0;
+    ch->phi = init_phi(ch->fi, time);
+    ch->adr = 0.0;
     ch->cn0 = cn0;
     ch->pli = 1.0;
     ch->lost_cnt = 0;
@@ -400,9 +558,10 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
 {
     float *fds = ch->acq->fds;
     float *fd_ext_bins = NULL;
+    int assisted = ch->acq->fd_ext_valid;
     int n = ch->acq->len_fds;
     
-    if (ch->acq->fd_ext != 0.0) { // assist by external Doppler
+    if (assisted) { // assist by external Doppler
         int nw = (ch->acq->fd_ext_n > 0) ? ch->acq->fd_ext_n : 3;
         fd_ext_bins = (float *)sdr_malloc(sizeof(float) * nw);
         for (int k = 0; k < nw; k++) {
@@ -421,14 +580,21 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
         ch->fi, fds, n, ch->acq->P_sum);
     ch->acq->n_sum++;
     
-    if (ch->acq->n_sum * ch->T >= sdr_t_acq) {
+    double t_acq = assisted ? sdr_t_acq_ext : sdr_t_acq;
+    if (ch->acq->n_sum * ch->T >= t_acq) {
         int idx[2];
         
         // search max correlation power
         float cn0 = sdr_corr_max(ch->acq->P_sum, 2 * ch->N, ch->N, n, ch->T,
             idx);
         
-        if (cn0 >= sdr_thres_cn0_l) {
+        double thres = sdr_thres_cn0_l;
+        if (assisted) {
+            double lost = !strncmp(ch->sig, "L6", 2) ? THRES_CN0_L6 :
+                sdr_thres_cn0_u;
+            thres = MAX(sdr_thres_cn0_ext, lost + 1.0);
+        }
+        if (cn0 >= thres) {
             double fd = sdr_fine_dop(ch->acq->P_sum, 2 * ch->N, fds, n, idx);
             double coff = idx[1] / ch->fs;
             start_track(ch, time, fd, coff, cn0);
@@ -444,6 +610,7 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
         ch->acq->P_sum = NULL;
         ch->acq->n_sum = 0;
         ch->acq->fd_ext = 0.0;
+        ch->acq->fd_ext_valid = 0;
         ch->acq->fd_ext_n = 0;
     }
     sdr_free(fd_ext_bins);
@@ -470,6 +637,8 @@ static void sync_sec_code(sdr_ch_t *ch, int N)
         }
         if (fabsf(P) < THRES_LOST) {
             ch->trk->sec_sync = ch->trk->sec_pol = 0;
+            ch->trk->e5b_pol = ch->trk->e5b_cnt = 0; // re-calibrate E5b pol.
+            ch->trk->e5b_score = 0.0;
         }
     }
     if (ch->trk->sec_sync > 0) {
@@ -505,16 +674,14 @@ static void FLL(sdr_ch_t *ch)
 }
 
 // PLL (3rd-order, a3=1.1, b3=2.4, Bn=W/0.7845) --------------------------------
-static void PLL(sdr_ch_t *ch)
+static void PLL(sdr_ch_t *ch, double IP, double QP, double dt, int costas)
 {
-    double IP = ch->trk->C[0][0];
-    double QP = ch->trk->C[0][1];
-    if (IP != 0.0) {
-        double err_phas = (ch->costas ? atan(QP / IP) : atan2(QP, IP)) / DPI;
+    if (IP != 0.0 || (!costas && QP != 0.0)) {
+        double err_phas = (costas ? atan(QP / IP) : atan2(QP, IP)) / DPI;
         double W = sdr_b_pll / 0.7845;
-        ch->trk->phas_acc += W * W * W * err_phas * ch->T;
+        ch->trk->phas_acc += W * W * W * err_phas * dt;
         ch->fd += 2.4 * W * (err_phas - ch->trk->err_phas) +
-            1.1 * W * W * err_phas * ch->T + ch->trk->phas_acc * ch->T;
+            1.1 * W * W * err_phas * dt + ch->trk->phas_acc * dt;
         ch->trk->err_phas = err_phas;
     }
 }
@@ -576,12 +743,14 @@ static void bump_jump(sdr_ch_t *ch)
 }
 
 // update C/N0 and carrier lock indicator (returns 1 at decision window) --------
-static int CN0(sdr_ch_t *ch)
+static int CN0(sdr_ch_t *ch, double IPs, double QPs, int pli_upd)
 {
     ch->trk->sumP +=
         SQR(ch->trk->P[SDR_N_HIST-1][0]) + SQR(ch->trk->P[SDR_N_HIST-1][1]);
-    ch->trk->sumD += // IP^2 - QP^2 for carrier lock detector (cos 2*phi)
-        SQR(ch->trk->P[SDR_N_HIST-1][0]) - SQR(ch->trk->P[SDR_N_HIST-1][1]);
+    if (pli_upd) {
+        ch->trk->sumD += SQR(IPs) - SQR(QPs);
+        ch->trk->sumPs += SQR(IPs) + SQR(QPs);
+    }
     ch->trk->sumN += SQR(ch->trk->C[3][0]) + SQR(ch->trk->C[3][1]);
     if (ch->trk->npos >= 6) {
         ch->trk->sumVE += SQR(ch->trk->C[4][0]) + SQR(ch->trk->C[4][1]);
@@ -589,18 +758,21 @@ static int CN0(sdr_ch_t *ch)
     }
     if (ch->lock % (int)(T_CN0 / ch->T) != 0) return 0;
     
-    if (ch->trk->sumP > 0.0) {
-        ch->pli = ch->trk->sumD / ch->trk->sumP; // cos 2*phi in [-1,1]
+    if (ch->trk->sumPs > 0.0) {
+        ch->pli = ch->trk->sumD / ch->trk->sumPs; // cos 2*phi in [-1,1]
         ch->pli_valid = 1;
     }
     if (ch->trk->sumN > 0.0) {
-        double cn0 = 10.0 * log10(ch->trk->sumP / ch->trk->sumN / ch->T);
+        double S = MAX(ch->trk->sumP - ch->trk->sumN,
+            0.01 * ch->trk->sumN);
+        double cn0 = 10.0 * log10(S / ch->trk->sumN / ch->T);
         ch->cn0 += FILT_CN0 * (cn0 - ch->cn0);
     }
     if (ch->trk->npos >= 6) {
         bump_jump(ch);
     }
-    ch->trk->sumP = ch->trk->sumN = ch->trk->sumD = 0.0;
+    ch->trk->sumP = ch->trk->sumN = 0.0;
+    ch->trk->sumPs = ch->trk->sumD = 0.0;
     return 1;
 }
 
@@ -623,51 +795,69 @@ static void test_lost(sdr_ch_t *ch)
         ch->prn, ch->cn0, ch->pli);
 }
 
-// interpolate correlation -----------------------------------------------------
-static void interp_corr(const sdr_cpx_t *C, double x, sdr_cpx_t *c)
+// decode L6 CSK by chip-domain FFT correlation (returns code shift (chips)) ----
+static int CSK(sdr_ch_t *ch, const sdr_cpx16_t *IQ, double coff_frc)
 {
-    int i = (int)x;
-    double a1 = x - i, a0 = 1.0 - a1;
-    (*c)[0] = (float)(a0 * C[i][0] + a1 * C[i+1][0]);
-    (*c)[1] = (float)(a0 * C[i][1] + a1 * C[i+1][1]);
-}
-
-// decode L6 CSK ---------------------------------------------------------------
-static void CSK(sdr_ch_t *ch, const sdr_cpx_t *corr)
-{
-    double R = (double)ch->N / (ch->len_code / 2); // samples / chips 
-    int n = (int)(280 * R);
-    sdr_cpx_t *C = sdr_cpx_malloc(2 * n);
-    memcpy(C, corr + ch->N - n, sizeof(sdr_cpx_t) * n);
-    memcpy(C + n, corr, sizeof(sdr_cpx_t) * n);
-    
-    // interpolate correlation powers and detect peak
+    static __thread sdr_cpx_t *cpx = NULL;
+    int W = CSK_WIN, M = CSK_NFFT;
+    if (!cpx) {
+        cpx = sdr_cpx_malloc(M * 2);
+    }
+    // bin carrier-mixed IF data to code chips (TDM slots: L6D=0, L6E=1)
+    int L = ch->len_code / 2;
+    sdr_bin_csk(IQ, ch->N, ch->len_code, !strcmp(ch->sig, "L6E") ? 1 : 0,
+        coff_frc, cpx);
+    memset(cpx + L, 0, sizeof(sdr_cpx_t) * (M - L));
+    // correlate with periodically extended code (X[s] = cpx[M - W + s])
+    if (sdr_cpx_fft(cpx, M, SDR_FFT_FORWARD, cpx + M)) {
+        sdr_cpx_mul(cpx + M, ch->trk->code_fft, M, 1.0f / M / M, cpx + M);
+        (void)sdr_cpx_fft(cpx + M, M, SDR_FFT_BACKWARD, cpx);
+    }
+    // narrow peak search range by code shift reference after L6 frame sync
+    int i0 = -255, i1 = 255, ref = ch->trk->csk_ref;
+    if (ch->nav->fsync > 0 && ref >= 0) {
+        i0 = ref - 255;
+        i1 = ref;
+    }
+    // detect correlation peak
     double P_max = 0.0;
-    int ix = 0;
-    for (int i = -255; i <= 255; i++) {
-        sdr_cpx_t c;
-        interp_corr(C, n + i * R, &c);
-        double P = sdr_cpx_abs(c);
+    int ix = i0;
+    for (int i = i0; i <= i1; i++) {
+        const float *c = cpx[M - W + i];
+        double P = SQR(c[0]) + SQR(c[1]); // squared magnitude
         if (P <= P_max) continue;
         P_max = P;
         ix = i;
     }
-    // add CSK symbol to buffer 
+    // add CSK symbol to buffer
     uint8_t sym = (uint8_t)(255 - ix % 256);
     sdr_add_buff(ch->nav->syms, SDR_MAX_NSYM, &sym, sizeof(sym));
-    
-    // generate correlator outputs
-    for (int i = 0; i < ch->trk->npos + ch->trk->nposx; i++) {
-        interp_corr(C, n + ix * R + ch->trk->pos[i], ch->trk->C + i);
+
+    // update code shift reference (ix = ref - symbol, see decode_L6_frame())
+    if (ch->nav->fsync <= 0) {
+        ch->trk->csk_ref = -1;
+    } else if (ref < 0) {
+        int off = (int)floor(ch->nav->coff * 10230 / ch->T + 0.5) + 1;
+        ref = ix + (uint8_t)(sym + off);
+        ch->trk->csk_ref = (ref < 0 || ref > 255) ? -1 : ref;
     }
-    sdr_cpx_free(C);
+    return ix;
 }
 
 // update TOW ------------------------------------------------------------------
 static void update_tow(sdr_ch_t *ch, double sec)
 {
     if (ch->tow < 0) return;
-    ch->tow = (ch->tow + (int)(sec / 1e-3)) % (86400 * 7 * 1000);
+    ch->tow += (int)floor(sec / 1e-3 + 0.5);
+    
+    // the week has to follow the TOW rollover until the next week is decoded
+    if (ch->tow >= 86400 * 7 * 1000) {
+        ch->tow -= 86400 * 7 * 1000;
+        if (ch->week > 0) ch->week++;
+    } else if (ch->tow < 0) {
+        ch->tow += 86400 * 7 * 1000;
+        if (ch->week > 0) ch->week--;
+    }
 }
 
 // adjust code offset (0 <= ch->coff < ch->T) ----------------------------------
@@ -685,6 +875,12 @@ static void adj_coff(sdr_ch_t *ch)
         ch->lock++;
         memmove(ch->trk->P, ch->trk->P + 1, sizeof(sdr_cpx_t) *
             (SDR_N_HIST - 1));
+    } else {
+        return;
+    }
+    if (!strcmp(ch->sig, "E5ABQ")) { // re-calibrate E5b combination polarity
+        ch->trk->e5b_pol = ch->trk->e5b_cnt = 0;
+        ch->trk->e5b_score = 0.0;
     }
 }
 
@@ -704,34 +900,37 @@ static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
     
     if (!strcmp(ch->sig, "L6D") || !strcmp(ch->sig, "L6E")) {
         int i = (int)floor(ch->coff * ch->fs);
-        int j = (int)((ch->coff * ch->fs - i) * SDR_N_CODES);
         
         // mix carrier
         sdr_mix_carr(buff, ix + i, ch->N, ch->fs, fc, ch->phi + fc * i / ch->fs,
             ch->data);
         
-        // FFT correlator 
-        sdr_corr_fft(ch->data, ch->trk->code_fft + j * ch->N, ch->N, ch->corr);
+        // decode L6 CSK
+        int csk = CSK(ch, ch->data, ch->coff * ch->fs - i);
         
-        // decode L6 CSK 
-        CSK(ch, ch->corr);
+        // standard correlator with CSK-shifted code (carrier mixing fused)
+        // (fixed code polarity: window is symbol-aligned and circular)
+        double R = (double)ch->N / (ch->len_code / 2); // samples / chip
+        sdr_cpx_t C1[2];
+        sdr_corr_std(buff, ix + i, ch->N, ch->fs, fc,
+            ch->phi + fc * i / ch->fs, ch->trk->code, ch->trk->code_sum,
+            NULL, NULL, ch->trk->code_scale, ch->coff * ch->fs - i + csk * R,
+            ch->trk->pos, ch->trk->npos + ch->trk->nposx, 1, ch->trk->C, C1);
         
         // add P correlator outputs to history 
         sdr_add_buff(ch->trk->P, SDR_N_HIST, ch->trk->C[0], sizeof(sdr_cpx_t));
     } else {
         sdr_cpx_t C1[2];
         
-        // mix carrier
-        sdr_mix_carr(buff, ix, ch->N, ch->fs, fc, ch->phi, ch->data);
-        
-        // standard correlator
         if (!strcmp(ch->sig, "E5ABQ")) {
-            sdr_corr_std_cpx_code(ch->data, select_e5abq_bank(ch), ch->N,
-                ch->coff * ch->fs, ch->trk->pos,
-                ch->trk->npos + ch->trk->nposx, ch->trk->C, C1);
+            // correlate E5aQ/E5bQ sidebands separately and combine them
+            corr_e5abq(ch, buff, ix, fc, C1);
         } else {
-            sdr_corr_std(ch->data, ch->trk->code, ch->N, ch->coff * ch->fs,
-                ch->trk->pos, ch->trk->npos + ch->trk->nposx, ch->trk->C, C1);
+            // standard correlator (carrier mixing fused)
+            sdr_corr_std(buff, ix, ch->N, ch->fs, fc, ch->phi, ch->trk->code,
+                ch->trk->code_sum, NULL, NULL, ch->trk->code_scale,
+                ch->coff * ch->fs, ch->trk->pos,
+                ch->trk->npos + ch->trk->nposx, 0, ch->trk->C, C1);
         }
         for (int i = 0; i < 2; i++) {
             C1[0][i] = (C1[0][i] + ch->trk->C1[i]) / ch->N;
@@ -742,18 +941,48 @@ static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
     update_tow(ch, ch->T);
     ch->lock++;
     
-    // sync and remove secondary code 
+    // sync and remove secondary code
     if (ch->len_sec_code >= 2 && ch->lock * ch->T >= T_NPULLIN) {
         sync_sec_code(ch, ch->len_sec_code);
     }
-    // FLL/PLL, DLL and update C/N0 
+    // FLL/PLL, DLL and update C/N0
+    double IP = ch->trk->C[0][0];
+    double QP = ch->trk->C[0][1];
+    double IPs = ch->trk->P[SDR_N_HIST-1][0];
+    double QPs = ch->trk->P[SDR_N_HIST-1][1];
+    int pli_upd = 1;
     if (ch->lock * ch->T <= T_FPULLIN) {
         FLL(ch);
+        ch->trk->Cs[0] = ch->trk->Cs[1] = 0.0f;
+        ch->trk->coh_n = 0;
+    } else if (ch->pilot && ch->trk->sec_sync > 0) {
+        int K = MAX(1, (int)(sdr_t_coh / ch->T + 0.5));
+        double dt = K * ch->T;
+        if (sdr_b_pll * dt < 0.4) {
+            ch->trk->Cs[0] += (float)IP;
+            ch->trk->Cs[1] += (float)QP;
+            ch->trk->coh_n++;
+            pli_upd = 0;
+            if (ch->trk->coh_n >= K) {
+                IPs = ch->trk->Cs[0];
+                QPs = ch->trk->Cs[1];
+                PLL(ch, IPs, QPs, dt, 0);
+                ch->trk->Cs[0] = ch->trk->Cs[1] = 0.0f;
+                ch->trk->coh_n = 0;
+                pli_upd = 1;
+            }
+        } else {
+            PLL(ch, IP, QP, ch->T, ch->costas);
+            ch->trk->Cs[0] = ch->trk->Cs[1] = 0.0f;
+            ch->trk->coh_n = 0;
+        }
     } else {
-        PLL(ch);
+        PLL(ch, IP, QP, ch->T, ch->costas);
+        ch->trk->Cs[0] = ch->trk->Cs[1] = 0.0f;
+        ch->trk->coh_n = 0;
     }
     DLL(ch);
-    int cn0_upd = CN0(ch);
+    int cn0_upd = CN0(ch, IPs, QPs, pli_upd);
     
     // decode navigation data
     if (ch->lock * ch->T >= T_NPULLIN) {

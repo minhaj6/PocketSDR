@@ -74,6 +74,9 @@
 //  2025-01-12  1.16 filp code polarity
 //                   L1CP modulation: BOC(1,1) -> TMBOC(6,1,4/33)
 //  2025-11-20  1.17 add Galileo E5a-QP as E5AQP
+//  2026-07-08  1.18 E1B/E1C modulation: BOC(1,1) -> CBOC(6,1,1/11)
+//                   add API sdr_code_scale()
+//  2026-07-19  1.19 add API sdr_sig_pilot()
 //
 #include <ctype.h>
 #include "pocket_sdr.h"
@@ -1383,6 +1386,24 @@ static int8_t *sec_code_G3OCP(int prn, int *N)
     return NH10;
 }
 
+// modulation of code by CBOC(6,1,1/11) ([5]) -----------------------------------
+// (sign: +1 = data (E1B), -1 = pilot (E1C), amplitude scaled by SDR_CBOC_SCALE)
+static int8_t *mod_code_CBOC(const int8_t *code, int n, int sign)
+{
+    int8_t *code_mod = (int8_t *)sdr_malloc(n * 12);
+    double a = sqrt(10.0 / 11.0) * SDR_CBOC_SCALE; // BOC(1,1) component
+    double b = sqrt( 1.0 / 11.0) * SDR_CBOC_SCALE; // BOC(6,1) component
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < 12; j++) {
+            int sc1 = j < 6 ? 1 : -1, sc6 = j % 2 ? -1 : 1;
+            code_mod[i*12+j] = (int8_t)(code[i] *
+                (int)floor(a * sc1 + sign * b * sc6 + 0.5));
+        }
+    }
+    return code_mod;
+}
+
 // generate E1B code ([5]) -----------------------------------------------------
 static int8_t *gen_code_E1B(int prn, int *N)
 {
@@ -1390,10 +1411,10 @@ static int8_t *gen_code_E1B(int prn, int *N)
         return NULL;
     }
     int n = 4092;
-    *N = n * 2;
+    *N = n * 12;
     if (!E1B[prn-1]) {
         int8_t *code = read_code_hex(code_gal_E1B[prn-1], n);
-        E1B[prn-1] = mod_code(code, n, BOC, 2); // BOC(1,1) instead of CBOC
+        E1B[prn-1] = mod_code_CBOC(code, n, 1); // CBOC(6,1,1/11)
         sdr_free(code);
     }
     return E1B[prn-1];
@@ -1406,10 +1427,10 @@ static int8_t *gen_code_E1C(int prn, int *N)
         return NULL;
     }
     int n = 4092;
-    *N = n * 2;
+    *N = n * 12;
     if (!E1C[prn-1]) {
         int8_t *code = read_code_hex(code_gal_E1C[prn-1], n);
-        E1C[prn-1] = mod_code(code, n, BOC, 2); // BOC(1,1) instead of CBOC
+        E1C[prn-1] = mod_code_CBOC(code, n, -1); // CBOC(6,1,1/11)
         sdr_free(code);
     }
     return E1C[prn-1];
@@ -2497,14 +2518,7 @@ void sdr_sat_id(const char *sig, int prn, char *sat)
     } else if (Sig[0] == 'E' && prn >= 1 && prn <= 36) { // Galileo
         sprintf(sat, "E%02d", prn);
     } else if (Sig[0] == 'B' && prn >= 1 && prn <= 63) { // BDS
-        if ((!strncmp(Sig, "B1C", 3) || !strncmp(Sig, "B2A", 3)) &&
-            (prn < 19 || prn > 58)) {
-            sprintf(sat, "???");
-        } else if (!strcmp(Sig, "B2I") && prn > 18) {
-            sprintf(sat, "???");
-        } else {
-            sprintf(sat, "C%02d", prn);
-        }
+        sprintf(sat, "C%02d", prn);
     } else if (Sig[0] == 'I' && prn >= 1 && prn <= 14) { // NavIC
         sprintf(sat, "I%02d", prn);
     } else {
@@ -2532,6 +2546,49 @@ int sdr_sig_boc(const char *sig)
         !strcmp(Sig, "E1C") || !strcmp(Sig, "L1CB") || !strcmp(Sig, "B1CD") ||
         !strcmp(Sig, "B1CP") || !strcmp(Sig, "I1SP") || !strcmp(Sig, "I1SD") ||
         !strcmp(Sig, "E5ABQ");
+}
+
+//------------------------------------------------------------------------------
+//  Test if a signal is a dataless pilot with a secondary code.
+//
+//  args:
+//      sig      (I) Signal type as string ('L1CA', 'L1CB', 'L1CP', ....)
+//
+//  return:
+//      1: pilot signal, 0: other signal
+//
+int sdr_sig_pilot(const char *sig)
+{
+    char Sig[16];
+
+    sig_upper(sig, Sig);
+
+    return !strcmp(Sig, "L1CP") || !strcmp(Sig, "L5Q" ) ||
+        !strcmp(Sig, "L5SQ") || !strcmp(Sig, "G2OCP") ||
+        !strcmp(Sig, "G3OCP") || !strcmp(Sig, "E1C"  ) ||
+        !strcmp(Sig, "E5AQ") || !strcmp(Sig, "E5ABQ") ||
+        !strcmp(Sig, "E5BQ") || !strcmp(Sig, "E6C"  ) ||
+        !strcmp(Sig, "B1CP") || !strcmp(Sig, "B2AP" ) ||
+        !strcmp(Sig, "I1SP");
+}
+
+//------------------------------------------------------------------------------
+//  Get the code amplitude scale of a signal. Multi-level codes (CBOC) are
+//  generated as int8_t chips scaled by the value. (1 for -1/0/+1 codes)
+//
+//  args:
+//      sig      (I) Signal type as string ('L1CA', 'L1CB', 'L1CP', ....)
+//
+//  return:
+//      Code amplitude scale
+//
+int sdr_code_scale(const char *sig)
+{
+    char Sig[16];
+
+    sig_upper(sig, Sig);
+
+    return (!strcmp(Sig, "E1B") || !strcmp(Sig, "E1C")) ? SDR_CBOC_SCALE : 1;
 }
 
 //------------------------------------------------------------------------------

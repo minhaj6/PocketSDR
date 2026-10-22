@@ -9,6 +9,7 @@
 #  2022-01-13  1.1  support tracking of L6D, L6E
 #  2022-02-15  1.2  update ch state by external trigger
 #  2022-12-19  1.3  fix domain error in C/N0 computation
+#  2026-07-19  1.4  remove prompt-noise bias from C/N0 estimate
 #
 from math import *
 import numpy as np
@@ -28,7 +29,7 @@ B_FLL      = (5.0, 2.0)      # band-width of FLL filter (Hz) (wide, narrow)
 SP_CORR    = 0.25            # default correlator spacing (chip)
 MAX_DOP    = 5000.0          # default max Doppler for acquisition (Hz)
 N_CODE     = 10              # number of code bank
-THRES_CN0  = (35.0, 32.0)    # C/N0 threshold (dB-Hz) (lock, lost)
+THRES_CN0  = (35.0, 25.0)    # C/N0 threshold (dB-Hz) (lock, lost)
 THRES_SYNC  = 0.02           # threshold for sec-code sync
 THRES_LOST  = 0.002          # threshold for sec-code lost
 
@@ -176,13 +177,25 @@ def search_sig(ch, time, buff, ix):
         ch.acq.P_sum[:][:] = 0.0
         ch.acq.n_sum = 0
 
+# initial carrier NCO phase ------------------------------------------------------
+def init_phi(fi, time):
+    # phi = frac(fi * time) on the common receiver time origin to cancel the
+    # start-time dependent fractional carrier phase bias between CHs
+    # (time on 1 ms grid; split the product to avoid precision loss)
+    n = int(floor(time / 1e-3 + 0.5))
+    s, r = n // 1000, n % 1000
+    k = (int(floor(fi)) * r) % 1000
+    fi_f = fi - floor(fi)
+    phi = fi_f * s + (fi_f * r + k) * 1e-3
+    return phi - floor(phi)
+
 # start tracking ---------------------------------------------------------------
 def start_track(ch, fd, coff, cn0):
     ch.state = 'LOCK'
     ch.lock = 0
     ch.fd = fd
     ch.coff = coff
-    ch.phi = 0.0
+    ch.phi = init_phi(ch.fi, ch.time)
     ch.adr = 0.0
     ch.cn0 = cn0
     trk_init(ch.trk)
@@ -300,7 +313,8 @@ def CN0(ch):
     ch.trk.sumN += np.abs(ch.trk.C[3]) ** 2
     if ch.lock % int(T_CN0 / ch.T) == 0:
         if ch.trk.sumP > 0.0 and ch.trk.sumN > 0.0:
-            cn0 = 10.0 * log10(ch.trk.sumP / ch.trk.sumN / ch.T)
+            S = np.max([ch.trk.sumP - ch.trk.sumN, 0.01 * ch.trk.sumN])
+            cn0 = 10.0 * log10(S / ch.trk.sumN / ch.T)
             ch.cn0 += 0.5 * (cn0 - ch.cn0)
         ch.trk.sumP = ch.trk.sumN = 0.0
 

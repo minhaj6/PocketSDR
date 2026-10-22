@@ -1,8 +1,8 @@
 
-# **Pocket SDR - An Open-Source GNSS SDR,<br> ver. 0.17**
+# **Pocket SDR - An Open-Source GNSS SDR,<br> ver. 0.21**
 
 <div style="text-align: right;">
-<strong>2026-06-17</strong>
+<strong>2026-10-21</strong>
 </div>
 
 ---
@@ -118,11 +118,13 @@ PocketSDR
 │   ├── pocket_scan  # Scan and list USB devices
 │   ├── pocket_acq   # GNSS signal acquisition
 │   ├── pocket_trk   # GNSS signal tracking and PVT generation
+│   ├── pocket_web   # GNSS receiver server with Web UI
 │   ├── pocket_snap  # Snapshot Positioning
 │   ├── pocket_calib # Antenna array attitude / per-CH bias calibration
 │   ├── convbin      # RINEX converter supporting Pocket SDR
 │   └── str2str      # Stream converter (RTKLIB-derived)
 ├── src         # Pocket SDR library source programs
+├── html        # Web UI files served by pocket_web (JS + CSS, no build step)
 ├── python      # Pocket SDR Python scripts (incl. pocket_sdr.py GUI)
 ├── lib         # Libraries for APs and Python scripts
 │   ├── win32        # Built libraries for Windows (UCRT64)
@@ -486,6 +488,25 @@ Note: FFTW3 is GPL-licensed, so a binary linked against it inherits GPL terms. K
 --------------------------------------------------------------------------------
 <div class="pagebreak"></div>
 
+## **Using AVX-512 instructions (optional)**
+
+On x86-64 CPUs with AVX-512 (AMD Zen 4 or later such as Ryzen 9000 series,
+Intel Ice Lake or later), `libsdr` can be built with `USE_AVX512=1` to use the
+AVX-512 versions of the carrier mixer, correlator, LPF and array covariance
+kernels (`-DAVX512`) instead of the default AVX2 ones. The APs link `libsdr`
+statically, so rebuild them after the library. A binary built with
+`USE_AVX512=1` does not run on a CPU without AVX-512.
+```
+$ cd <install_dir>/lib/build
+$ make clean && make USE_AVX512=1 && make install
+$ cd <install_dir>/app
+$ make clean && make && make install
+```
+The unit tests can be built with the same option: `make -C test/utest USE_AVX512=1`.
+
+--------------------------------------------------------------------------------
+<div class="pagebreak"></div>
+
 ## **GNSS SDR Utilities and APs**
 
 Pocket SDR includes the following utilities for the Pocket SDR FE.
@@ -505,6 +526,7 @@ Pocket SDR also provides the following GNSS SDR APs:
 - **pocket_acq**    : A C-version of pocket_acq.py (w/o graphical plots).
 - **pocket_trk**    : A C-version of pocket_trk.py (w/o graphical plots).
 - **pocket_snap**   : A C-version of pocket_snap.py.
+- **pocket_web**    : A GNSS SDR receiver server controlled from a Web UI.
 
 For more details about these utilities and APs, please refer to [**Pocket SDR Command References**](https://github.com/tomojitakasu/PocketSDR/blob/master/doc/command_ref.pdf).
 
@@ -523,6 +545,52 @@ $ sudo python <install_dir>/python/pocket_sdr.py
 ```
 
 For more information about this application, please refer to [**pocket_sdr.py help**](https://github.com/tomojitakasu/PocketSDR/blob/master/doc/pocket_sdr_help.pdf).
+
+--------------------------------------------------------------------------------
+
+## **Web UI-based Real-Time GNSS SDR Receiver AP**
+
+Starting from version 0.20, Pocket SDR includes **pocket_web**, a real-time
+GNSS SDR receiver AP controlled from a Web UI in a browser. It provides the
+same receiver as pocket_trk and the same screens as pocket_sdr.py, but needs
+no GUI toolkit on the machine running the receiver, so it also suits a
+headless Raspberry Pi. To execute the AP:
+
+```
+$ cd <install_dir>/bin
+$ sudo ./pocket_web -web 8080
+```
+
+Then open `http://localhost:8080/` in a browser. The receiver starts stopped:
+set the input source, output streams and signals in the Input, Output and
+Signal Options pages, and press Start. The settings are saved when the
+receiver is stopped and when the AP exits, and are restored at the next
+start, so `-start` starts the receiver right away with them.
+
+To reach the AP from another PC, a tablet or a phone, bind it to all
+interfaces:
+
+```
+$ sudo ./pocket_web -web 0.0.0.0:8080
+```
+
+Note that the interface is unauthenticated and unencrypted. Use it in a
+trusted LAN only, or front it with a reverse proxy providing HTTPS and
+authentication.
+
+`run_sdr.sh` in the top directory starts and stops the server:
+
+```
+$ ./run_sdr.sh          # start
+$ ./run_sdr.sh -stop    # stop
+```
+
+Always stop the AP this way or with Ctrl-C. If the process is killed, the RF
+frontend is left streaming and needs a USB reset to recover (pocket_web
+recovers it at the next start, but the running capture is lost).
+
+For more information about this AP, please refer to [**Pocket SDR Command
+References**](https://github.com/tomojitakasu/PocketSDR/blob/master/doc/command_ref.pdf).
 
 --------------------------------------------------------------------------------
 
@@ -638,5 +706,47 @@ purposes, is prohibited.
   `lost_th` options). Replaced external Viterbi / Reed-Solomon / LDPC decoders
   with internal implementations. Improved the symbol-sync algorithm. Improved
   the `pocket_sdr.py` UI (options Load / Save, etc.).
+- **2026-07-06 (v0.18)**: Reworked the QZSS L6 CSK decoder: chip-domain FFT
+  symbol detection with sampling-rate-independent cost, E/P/L correlations by
+  the standard correlator with the CSK-shifted code (improves L6 pseudorange
+  quality), and a narrowed peak search after frame sync. L6 tracking is 3-8x
+  faster; 8 L6 channels at 24 Msps fit on a Raspberry Pi 5 (see
+  doc/update_csk_decoder.md). Fused carrier wipeoff into the standard and FFT
+  correlators and unified the int8 code banks. Optimized NEON paths for
+  Raspberry Pi 5 (SDOT). Added option `-w` for FFTW wisdom import.
+- **2026-07-24 (v0.19)**: Added int8 code support to the correlators for
+  multi-level sub-carrier replicas: CBOC for Galileo E1B / E1C and AltBOC for
+  E5. Improved E5 AltBOC tracking with pre-combined complex replicas on a
+  restored complex correlator path. Added extended coherent tracking for
+  pilot signals and low-C/N0 acquisition / tracking options (`t_acq_ext`,
+  `t_coh`, `thres_cn0_ext`). Removed the C/N0 estimation bias at low C/N0.
+  Widened the pseudorange lower bound for GEO / IGSO epoch seeding.
+  Generalized the output streams: up to 8 streams with selectable types
+  (NMEA, RTCM3, receiver log, IF data log), e.g. NMEA to a file and a TCP
+  server simultaneously (`-nmea` / `-rtcm` / `-log` / `-raw` repeatable in
+  pocket_trk; new Output Options UI in pocket_sdr.py).
+- **2026-08-08 (v0.20)**: Added a Web UI. The new AP **pocket_web** embeds an
+  HTTP + WebSocket server (src/sdr_web.c) and serves a static front end (html/,
+  plain JS, no dependency or build step), so a browser drives the whole
+  receiver, even on a headless Raspberry Pi, with the settings kept across
+  sessions (see doc/design_web_ui.md). Recovered a Pocket SDR FE left streaming
+  by a killed session. pocket_trk keeps its command line.
+- **2026-10-21 (v0.21)**: Added multi-device and multi-channel SoapySDR input:
+  devices sharing a common 10 MHz and 1PPS are opened as one multi-channel
+  frontend (up to 8 RF channels) with the streams started at a common time,
+  including `-RFCH` assignment and `-arch` array combining. Added SoapySDR
+  options `-EXT_CLOCK` and `-gpio`, dropped-sample zero-fill, sensor logging
+  (`-sens`), and multi-channel SoapySDR capture by pocket_dump for replay.
+  Enlarged the Pocket SDR FE raw data buffer to 128 MB with overflow logging
+  and a raised receiver thread priority, fixing the loss of all signals at
+  once at high data rates. Fast acquisition now predicts the satellites at
+  the receiver time instead of the host PC clock, so it also works for a GNSS
+  simulator and replayed IF data. Added AVX512 kernels for the carrier mixer,
+  correlators, LPF and complex multiply (`USE_AVX512=1`). Added a dark theme
+  to pocket_sdr.py. Fixed the satellite week not updated on the TOW rollover,
+  sat_id() for BeiDou B1C / B2a / B2I, the start-time dependent fractional
+  carrier phase bias between channels that broke the integer double-difference
+  ambiguities (GitHub issue #97), and potential buffer overflows in the
+  pocket_web JSON replies (GitHub issue #98).
 
 --------------------------------------------------------------------------------

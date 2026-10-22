@@ -24,6 +24,10 @@
 //  2025-02-18  1.9  fix bug on output files
 //                   add -rfch option
 //  2025-03-16  1.10 add -opt option, delete -w option
+//  2026-07-24  1.11 support up to 8 output streams by repeating -nmea, -rtcm,
+//                   -log and -raw options
+//  2026-08-02  1.12 add -arch and -geom options for antenna array
+//  2026-08-07  1.13 close the SDR device on console close for Windows
 //
 #include <math.h>
 #include <signal.h>
@@ -37,6 +41,7 @@
 #define NUM_COL    110          // number of channel status columns
 #define MAX_ROW    64           // max number of channel status rows
 #define MIN_LOCK   2.0          // min lock time for channel status (s)
+#define EXIT_WAIT  400          // max wait cycles (10 ms) for device close
 #define ESC_COL    "\033[34m"   // ANSI escape color blue
 #define ESC_RES    "\033[0m"    // ANSI escape reset
 #define ESC_VCUR   "\033[?25h"  // ANSI escape show cursor
@@ -49,8 +54,10 @@ static const char *usage_text[] = {
     "       [-fmt {INT8|INT8X2|RAW8|RAW16|RAW32|CS8|CS16}] [-f freq]",
     "       [-fo freq[,...]] [-IQ {1|2}[,...]] [-bits {2|3}[,...]",
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
-    "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
-    "       [-log path] [-nmea path] [-rtcm path] [-raw path] [-opt file] [file]",
+    "       [-driver name] [-gain gain] [-bw bw] [-gpio val] [-EXT_CLOCK]",
+    "       [-NO_SYNC] [-fd dopp] [-log path] [-nmea path] [-rtcm path]",
+    "       [-raw path] ... [-opt file] [-arch nch] [-geom file]",
+    "       [-sens name[,...]] [file]",
     NULL
 };
 
@@ -98,8 +105,22 @@ static int load_opt_file(const char *file)
     return 1;
 }
 
-// interrupt flag --------------------------------------------------------------
+// add output stream -------------------------------------------------------------
+static void add_str(int *types, const char **paths, int type, const char *path)
+{
+    for (int i = 0; i < SDR_MAX_STR; i++) {
+        if (types[i] != SDR_STR_NONE) continue;
+        types[i] = type;
+        paths[i] = path;
+        return;
+    }
+    fprintf(stderr, "too many output streams (max %d)\n", SDR_MAX_STR);
+    exit(-1);
+}
+
+// interrupt and shutdown completion flags -------------------------------------
 static volatile uint8_t intr = 0;
+static volatile uint8_t done = 0;
 
 // signal handler --------------------------------------------------------------
 static void sig_func(int sig)
@@ -107,6 +128,22 @@ static void sig_func(int sig)
     intr = 1;
     signal(sig, sig_func);
 }
+
+#ifdef WIN32
+
+// console control handler -----------------------------------------------------
+//   The C runtime raises SIGINT only for Ctrl-C and Ctrl-Break. Console close,
+//   logoff and shutdown terminate the process as soon as the handler returns,
+//   so wait here until the main thread has closed the SDR device.
+static BOOL WINAPI ctrl_func(DWORD type)
+{
+    intr = 1;
+    for (int i = 0; i < EXIT_WAIT && !done; i++) {
+        sdr_sleep_msec(10);
+    }
+    return TRUE;
+}
+#endif // WIN32
 
 // print version ---------------------------------------------------------------
 static void print_ver(void)
@@ -170,12 +207,15 @@ int main(int argc, char **argv)
     double tint = 0.1;
     const char *sig = "L1CA", *sigs[SDR_MAX_NCH];
     const char *file = "", *conf_file = "";
-    const char *paths[4] = {"", "", "", ""}, *opt_file = "";
+    int types[SDR_MAX_STR] = {0};
+    const char *paths[SDR_MAX_STR] = {"", "", "", "", "", "", "", ""};
+    const char *opt_file = "";
     const char *debug_file = "";
     const char *driver = "";
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
     char rfch_opt[1024] = "-RFCH";
-    
+    const char *geom_file = "";
+
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
             sig = argv[++i];
@@ -227,13 +267,13 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[i], "-c") && i + 1 < argc) {
             conf_file = argv[++i];
         } else if (!strcmp(argv[i], "-nmea") && i + 1 < argc) {
-            paths[0] = argv[++i];
+            add_str(types, paths, SDR_STR_NMEA, argv[++i]);
         } else if (!strcmp(argv[i], "-rtcm") && i + 1 < argc) {
-            paths[1] = argv[++i];
+            add_str(types, paths, SDR_STR_RTCM3, argv[++i]);
         } else if (!strcmp(argv[i], "-log") && i + 1 < argc) {
-            paths[2] = argv[++i];
+            add_str(types, paths, SDR_STR_LOG, argv[++i]);
         } else if (!strcmp(argv[i], "-raw") && i + 1 < argc) {
-            paths[3] = argv[++i];
+            add_str(types, paths, SDR_STR_IFDATA, argv[++i]);
         } else if (!strcmp(argv[i], "-h") && i + 1 < argc) {
             max_row = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-opt") && i + 1 < argc) {
@@ -246,8 +286,28 @@ int main(int argc, char **argv)
             gain = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-bw") && i + 1 < argc) {
             bw = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "-gpio") && i + 1 < argc) {
+            size_t len = strlen(rfch_opt);
+            snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -GPIO=%d",
+                atoi(argv[++i]));
+        } else if (!strcmp(argv[i], "-EXT_CLOCK")) {
+            size_t len = strlen(rfch_opt);
+            snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -EXT_CLOCK");
+        } else if (!strcmp(argv[i], "-NO_SYNC")) {
+            size_t len = strlen(rfch_opt);
+            snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -NO_SYNC");
         } else if (!strcmp(argv[i], "-fd") && i + 1 < argc) {
             max_dop = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "-arch") && i + 1 < argc) {
+            size_t len = strlen(rfch_opt);
+            snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -ARCH=%d",
+                atoi(argv[++i]));
+        } else if (!strcmp(argv[i], "-geom") && i + 1 < argc) {
+            geom_file = argv[++i];
+        } else if (!strcmp(argv[i], "-sens") && i + 1 < argc) {
+            size_t len = strlen(rfch_opt);
+            snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -SENS=%s",
+                argv[++i]);
         } else if (!strcmp(argv[i], "-v")) {
             print_ver();
         } else if (argv[i][0] == '-') {
@@ -270,7 +330,9 @@ int main(int argc, char **argv)
     
     signal(SIGTERM, sig_func);
     signal(SIGINT, sig_func);
-#ifndef WIN32
+#ifdef WIN32
+    SetConsoleCtrlHandler(ctrl_func, TRUE); // console close, logoff, shutdown
+#else
     signal(SIGPIPE, SIG_IGN);
 #endif
     uint32_t tt = sdr_get_tick();
@@ -285,16 +347,25 @@ int main(int argc, char **argv)
     }
     if (*file) {
         rcv = sdr_rcv_open_file(sigs, prns, nch, fmt, fs, fo, IQ, bits, toff,
-            tscale, file, paths, rfch_opt);
+            tscale, file, types, paths, rfch_opt);
     } else if (*driver) {
-        rcv = sdr_rcv_open_sdev(sigs, prns, nch, driver, fmt, fs, fo[0], paths,
-            rfch_opt);
+        rcv = sdr_rcv_open_sdev(sigs, prns, nch, driver, fmt, fs, fo, types,
+            paths, rfch_opt);
     } else {
-        rcv = sdr_rcv_open_dev(sigs, prns, nch, bus, port, conf_file, paths,
-            rfch_opt);
+        rcv = sdr_rcv_open_dev(sigs, prns, nch, bus, port, conf_file, types,
+            paths, rfch_opt);
     }
     if (!rcv) {
         return -1;
+    }
+    if (*geom_file) { // array element positions
+        double ant_pos[SDR_MAX_RFCH*3] = {0};
+        int ant_ena[SDR_MAX_RFCH] = {0};
+        int nant = sdr_array_geom_load(geom_file, ant_pos, SDR_MAX_RFCH);
+        for (int i = 0; i < nant; i++) ant_ena[i] = 1;
+        if (nant <= 0 || !sdr_rcv_array_ant_pos(rcv, ant_pos, ant_ena)) {
+            fprintf(stderr, "array geometry load error: %s\n", geom_file);
+        }
     }
     if (tint > 0.0) {
         printf("%s", ESC_HCUR);
@@ -315,5 +386,6 @@ int main(int argc, char **argv)
     if (*debug_file) {
         traceclose();
     }
+    done = 1; // release the console control handler
     return 0;
 }

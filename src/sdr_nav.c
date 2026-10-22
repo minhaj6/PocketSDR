@@ -78,13 +78,13 @@
 #define GPST_BDT    14.0      // GPST - BDT (s)
 #define GPST_UTC    18.0      // GPST - UTC (s) (2017-1-1 ~ )
 #define TOFF_L1CA   0.160     // time offset (s) L1CA
-#define TOFF_L1CA_S 1.019     // time offset (s) L1CA SBAS
+#define TOFF_L1CA_S 1.020     // time offset (s) L1CA SBAS
 #define TOFF_L1CD  18.520     // time offset (s) L1CD
-#define TOFF_L1CP  17.999     // time offset (s) L1CP
-#define TOFF_L2CM   0.879     // time offset (s) L2CM
-#define TOFF_L5I    0.439     // time offset (s) L5I
-#define TOFF_L5Q    0.439     // time offset (s) L5Q
-#define TOFF_L5I_S  1.090     // time offset (s) L5I SBAS (BDSBAS)
+#define TOFF_L1CP  18.000     // time offset (s) L1CP
+#define TOFF_L2CM   0.880     // time offset (s) L2CM
+#define TOFF_L5I    0.440     // time offset (s) L5I
+#define TOFF_L5Q    0.440     // time offset (s) L5Q
+#define TOFF_L5I_S  1.092     // time offset (s) L5I SBAS (BDSBAS)
 #define TOFF_L5SI   1.088     // time offset (s) L5SI
 #define TOFF_L6DE   1.0155    // time offset (s) L6D/E
 #define TOFF_G1CA   2.000     // time offset (s) G1CA
@@ -102,12 +102,14 @@
 #define TOFF_B1I_D1 6.220     // time offset (s) B1I D1
 #define TOFF_B1I_D2 0.622     // time offset (s) B1I D2
 #define TOFF_B1CD  18.720     // time offset (s) B1CD
-#define TOFF_B1CP  13.999     // time offset (s) B1CP
-#define TOFF_B2AD   3.119     // time offset (s) B2AD
-#define TOFF_B2AP   0.899     // time offset (s) B2AP
-#define TOFF_B2BI   1.015     // time offset (s) B2BI
+#define TOFF_B1CP  14.000     // time offset (s) B1CP
+#define TOFF_B2AD   3.120     // time offset (s) B2AD
+#define TOFF_B2AP   0.900     // time offset (s) B2AP
+#define TOFF_B2BI   1.016     // time offset (s) B2BI
 #define TOFF_I1SD  18.511     // time offset (s) I1SD
 #define TOFF_I5S    0.320     // time offset (s) I5S
+
+#define TOW_MS(t)  ((int)floor((t) / 1e-3 + 0.5)) // sec -> msec wo/ FP error
 
 // function prototypes in sdr_code.c -------------------------------------------
 int32_t rev_reg(int32_t R, int N);
@@ -361,16 +363,38 @@ static void hex_str(const uint8_t *data, int nbits, char *str, int size)
 // update tow ------------------------------------------------------------------
 static void update_tow(sdr_ch_t *ch, double tow)
 {
+    int tow_ms = TOW_MS(tow) % (86400 * 7 * 1000); // wrap at the end of week
+
     if (ch->tow <= 0) {
-        ch->tow = (int)(tow / 1e-3);
-    } else if (ch->tow == (int)(tow / 1e-3)) {
+        ch->tow = tow_ms;
+    } else if (ch->tow == tow_ms) {
         ch->tow_v = 1; // tow valid
     } else { // TOW mismatch
-        trace(2, "tow mismatch: sat=%s sig=%s tow=%.3f -> %.3f\n", ch->sat,
-            ch->sig, ch->tow * 1e-3, tow);
+        sdr_log(3, "$LOG,%.3f,%s,%s,%d,TOW MISMATCH %.3f -> %.3f", ch->time,
+            ch->sat, ch->sig, ch->prn, ch->tow * 1e-3, tow);
         ch->tow = -1;
         ch->tow_v = 0; // tow invalid
     }
+}
+
+// update week and tow ---------------------------------------------------------
+static void update_week_tow(sdr_ch_t *ch, int week, double tow)
+{
+    // TOW beyond the week end means the frame week has already rolled over
+    int roll = tow >= 86400.0 * 7;
+    if (roll) week++;
+
+    // a week of a single frame can be wrong without being detected (BeiDou
+    // D1/D2 BCH mis-correction), so a change needs 2 consecutive decodes
+    ch->nav->week_n = (week == ch->nav->week_p) ? ch->nav->week_n + 1 : 1;
+    ch->nav->week_p = week;
+    if (ch->week <= 0 || roll || ch->nav->week_n >= 2) {
+        ch->week = week;
+    } else if (week < ch->week - 1 || week > ch->week + 1) {
+        sdr_log(3, "$LOG,%.3f,%s,%s,%d,WEEK UNMATCH %d -> %d", ch->time,
+            ch->sat, ch->sig, ch->prn, ch->week, week);
+    }
+    update_tow(ch, tow);
 }
 
 //------------------------------------------------------------------------------
@@ -505,9 +529,18 @@ static void decode_SBAS_msgs(sdr_ch_t *ch, const uint8_t *bits, int rev)
         buff[i] = bits[i] ^ (uint8_t)rev;
     }
     if (test_CRC(buff, 250)) {
+        int tow_ms = TOW_MS(toff);
+        if (ch->tow > 0 && ((ch->tow - tow_ms) % 1000 + 1000) % 1000 != 0) {
+            // reject re-latch shifted by symbol slip (1 s message period)
+            sdr_log(3, "$LOG,%.3f,%s,%s,%d,TOW MISMATCH %.3f -> %.3f", ch->time,
+                ch->sat, ch->sig, ch->prn, ch->tow * 1e-3, toff);
+            unsync_nav(ch);
+            ch->nav->count[1]++;
+            return;
+        }
         ch->nav->fsync = ch->lock;
         ch->nav->rev = rev;
-        ch->tow = (int)(toff / 1e-3);
+        ch->tow = tow_ms;
         ch->tow_v = 2;
         int off = !strcmp(ch->sig, "L1CA") || !strcmp(ch->sig, "L1S") ? 8 : 6;
         sdr_pack_bits(buff, 250, 0, ch->nav->data); // SBAS message (250 bits)
@@ -709,9 +742,10 @@ static void decode_CNV2(sdr_ch_t *ch, const uint8_t *syms, int rev, int toi)
         ch->nav->nerr = nerr1 + nerr2;
         sdr_unpack_data(toi, 9, bits);
         sdr_pack_bits(bits, 883, 0, data);
-        ch->week = getbitu(data, 9, 13);
-        update_tow(ch, getbitu(data, 22, 8) * 7200.0 + (toi - 1) * 18.0 +
-            TOFF_L1CD);
+        // TOI = 0 means the next frame is in the next ITOW interval
+        double tow = getbitu(data, 22, 8) * 7200.0 +
+            (toi > 0 ? toi - 1 : 399) * 18.0 + TOFF_L1CD;
+        update_week_tow(ch, getbitu(data, 9, 13), tow);
         ch->nav->type = getbitu(data, 617, 6); // CNAV-2 SF3 page number
         memcpy(ch->nav->data, data, 111); // CNAV-2 SF1+SF2+SF3 (9+600+274 bits)
         ch->nav->stat = 1;
@@ -764,7 +798,7 @@ static void decode_L1CP(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_L1CP / 1e-3);
+        ch->tow = TOW_MS(TOFF_L1CP);
         ch->tow_v = 2; // amb-unresolved
     }
 }
@@ -933,7 +967,7 @@ static void decode_L5Q(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_L5Q / 1e-3);
+        ch->tow = TOW_MS(TOFF_L5Q);
         ch->tow_v = 2;
     }
 }
@@ -995,7 +1029,7 @@ static void decode_L6_frame(sdr_ch_t *ch, const uint8_t *syms, int N)
     
     if (ch->nav->nerr >= 0) {
         ch->nav->ssync = ch->nav->fsync = ch->lock;
-        ch->tow = (int)(TOFF_L6DE / 1e-3);
+        ch->tow = TOW_MS(TOFF_L6DE);
         ch->tow_v = 2;
         ch->nav->coff = (off - 1) * ch->T / 10230;
         ch->nav->type = getbitu(data, 40, 5); // L6 vender + facility ID
@@ -1258,7 +1292,7 @@ static void decode_G3OCP(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_G3OCP / 1e-3);
+        ch->tow = TOW_MS(TOFF_G3OCP);
         ch->tow_v = 2;
     }
 }
@@ -1307,8 +1341,8 @@ static void decode_gal_INAV(sdr_ch_t *ch, const uint8_t *syms, int rev)
         sdr_pack_bits(bits + 116,  16, 0, data + 14);
         int type = getbitu(data, 0, 6);
         if (type == 5) {
-            ch->week = getbitu(data, 73, 12) + GPST_GST_W;
-            update_tow(ch, getbitu(data, 85, 20) + toff);
+            update_week_tow(ch, getbitu(data, 73, 12) + GPST_GST_W,
+                getbitu(data, 85, 20) + toff);
         }
         ch->nav->type = type; // I/NAV word type
         if (type >= 0 && type <= 10 && 16 * type + 16 <= SDR_MAX_DATA) {
@@ -1362,7 +1396,7 @@ static void decode_E1C(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_E1C / 1e-3);
+        ch->tow = TOW_MS(TOFF_E1C);
         ch->tow_v = 2;
     }
 }
@@ -1384,13 +1418,15 @@ static void decode_gal_FNAV(sdr_ch_t *ch, const uint8_t *syms, int rev)
         ch->nav->rev = rev;
         sdr_pack_bits(bits, 238, 0, data); // F/NAV page (238 bits)
         int type = getbitu(data, 0, 6);
-        if (type >= 1 && type <= 3) {
-            int off[] = {155, 182, 174};
-            ch->week = getbitu(data, off[type-1], 12) + GPST_GST_W;
-        }
         if (type >= 1 && type <= 4) {
-            int off[] = {167, 194, 186, 189};
-            update_tow(ch, getbitu(data, off[type-1], 20) + TOFF_E5AI);
+            int off_w[] = {155, 182, 174}, off_t[] = {167, 194, 186, 189};
+            double tow = getbitu(data, off_t[type-1], 20) + TOFF_E5AI;
+            if (type <= 3) {
+                update_week_tow(ch, getbitu(data, off_w[type-1], 12) +
+                    GPST_GST_W, tow);
+            } else {
+                update_tow(ch, tow);
+            }
         }
         ch->nav->type = type; // F/NAV page type
         if (type >= 1 && type <= 6) {
@@ -1443,7 +1479,7 @@ static void decode_E5AQ(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_E5AQ / 1e-3);
+        ch->tow = TOW_MS(TOFF_E5AQ);
         ch->tow_v = 2;
     }
 }
@@ -1483,7 +1519,7 @@ static void decode_E5BQ(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_E5BQ / 1e-3);
+        ch->tow = TOW_MS(TOFF_E5BQ);
         ch->tow_v = 2;
     }
 }
@@ -1504,7 +1540,7 @@ static void decode_gal_CNAV(sdr_ch_t *ch, const uint8_t *syms, int rev)
         ch->nav->ssync = ch->nav->fsync = ch->lock;
         ch->nav->rev = rev;
         sdr_pack_bits(bits, 486, 0, data);
-        ch->tow = (int)(TOFF_E6B / 1e-3);
+        ch->tow = TOW_MS(TOFF_E6B);
         ch->tow_v = 2;
         ch->nav->type = getbitu(data, 20, 5); // C/NAV HAS message ID
         memcpy(ch->nav->data, data, 61); // C/NAV frame (486 bits)
@@ -1555,7 +1591,7 @@ static void decode_E6C(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_E6C / 1e-3);
+        ch->tow = TOW_MS(TOFF_E6C);
         ch->tow_v = 2;
     }
 }
@@ -1603,19 +1639,34 @@ static void decode_D1D2NAV(sdr_ch_t *ch, int type, const uint8_t *syms, int rev)
         memcpy(bits + i + 22, s1 + 11, 4);
         memcpy(bits + i + 26, s2 + 11, 4);
     }
+    sdr_pack_bits(bits, 300, 0, data);
+    int sf = getbitu(data, 15, 3), pg = getbitu(data, 42, 4);
+    if (nerr > 5 || sf < 1 || sf > 5) { // reject broken frame
+        unsync_nav(ch);
+        ch->nav->count[1]++;
+        sdr_log(3, "$LOG,%.3f,%s,%s,%d,BDS D1D2 FRAME ERROR (%d,%d)", time,
+            ch->sat, ch->sig, ch->prn, nerr, sf);
+        return;
+    }
     ch->nav->ssync = ch->nav->fsync = ch->lock;
     ch->nav->rev = rev;
     ch->nav->nerr = nerr;
-    sdr_pack_bits(bits, 300, 0, data);
-    int sf = getbitu(data, 15, 3), pg = getbitu(data, 42, 4);
-    if (type == 1 && sf == 1) {
-        ch->week = getbitu(data, 60, 13) + GPST_BDT_W;
-    } else if (type == 2 && sf == 1 && pg == 1) {
-        ch->week = getbitu(data, 64, 13) + GPST_BDT_W;
+    if (ch->tow <= 0) { // for diagnosis of initial TOW latch
+        sdr_log(3, "$LOG,%.3f,%s,%s,%d,D1D2 LATCH %d %d %d %d %d %d", time,
+            ch->sat, ch->sig, ch->prn, getbitu(data, 18, 8) * 4096 +
+            getbitu(data, 30, 12), sf, nerr, ch->lock, ch->trk->sec_sync,
+            ch->trk->sec_pol);
     }
     if (type == 1 || (type == 2 && sf == 1)) {
-        update_tow(ch, getbitu(data, 18, 8) * 4096.0 + getbitu(data, 30, 12) +
-            toff + GPST_BDT);
+        double tow = getbitu(data, 18, 8) * 4096.0 + getbitu(data, 30, 12) +
+            toff + GPST_BDT;
+        if (type == 1 && sf == 1) {
+            update_week_tow(ch, getbitu(data, 60, 13) + GPST_BDT_W, tow);
+        } else if (type == 2 && pg == 1) {
+            update_week_tow(ch, getbitu(data, 64, 13) + GPST_BDT_W, tow);
+        } else {
+            update_tow(ch, tow);
+        }
     }
     if (type == 1 && sf >= 1 && sf <= 5) {
         ch->nav->type = sf; // D1 SF ID
@@ -1763,9 +1814,8 @@ static void decode_BCNV1(sdr_ch_t *ch, const uint8_t *syms, int rev, int soh)
         ch->nav->seq = soh;
         ch->nav->nerr = nerr1 + nerr2;
         sdr_pack_bits(bits, 878, 0, data);
-        ch->week = getbitu(data, 14, 13) + GPST_BDT_W;
-        update_tow(ch, getbitu(data, 27, 8) * 3600.0 + soh * 18.0 + TOFF_B1CD +
-            GPST_BDT);
+        update_week_tow(ch, getbitu(data, 14, 13) + GPST_BDT_W,
+            getbitu(data, 27, 8) * 3600.0 + soh * 18.0 + TOFF_B1CD + GPST_BDT);
         ch->nav->type = getbitu(data, 614, 6); // CNAV-2 SF3 page ID
         memcpy(ch->nav->data, data, 110); // CNAV-2 SF1+SF2+SF3 (14+600+264 bits)
         ch->nav->stat = 1;
@@ -1816,7 +1866,7 @@ static void decode_B1CP(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_B1CP / 1e-3);
+        ch->tow = TOW_MS(TOFF_B1CP);
         ch->tow_v = 2;
     }
 }
@@ -1845,10 +1895,12 @@ static void decode_BCNV2(sdr_ch_t *ch, const uint8_t *syms, int rev)
         ch->nav->nerr = nerr;
         sdr_pack_bits(bits, 288, 0, data);
         int type = getbitu(data, 6, 6);
+        double tow = getbitu(data, 12, 18) * 3.0 + TOFF_B2AD + GPST_BDT;
         if (type == 10) {
-            ch->week = getbitu(data, 30, 13) + GPST_BDT_W;
+            update_week_tow(ch, getbitu(data, 30, 13) + GPST_BDT_W, tow);
+        } else {
+            update_tow(ch, tow);
         }
-        update_tow(ch, getbitu(data, 12, 18) * 3.0 + TOFF_B2AD + GPST_BDT);
         ch->nav->type = type; // B-CNAV2 message type
         memcpy(ch->nav->data, data, 36); // B-CNAV2 message (288 bits)
         ch->nav->stat = 1;
@@ -1899,7 +1951,7 @@ static void decode_B2AP(sdr_ch_t *ch)
         ch->tow = -1;
         ch->tow_v = 0;
     } else if ((ch->lock - ch->trk->sec_sync) % ch->len_sec_code == 0) {
-        ch->tow = (int)(TOFF_B2AP / 1e-3);
+        ch->tow = TOW_MS(TOFF_B2AP);
         ch->tow_v = 2;
     }
 }
@@ -1923,10 +1975,12 @@ static void decode_BCNV3(sdr_ch_t *ch, const uint8_t *syms, int rev)
         sdr_pack_bits(bits, 486, 0, data);
         int type = getbitu(data, 0, 6);
         if (ch->prn >= 6 && ch->prn <= 58) {
+            double tow = getbitu(data, 6, 20) + TOFF_B2BI + GPST_BDT;
             if (type == 30) {
-                ch->week = getbitu(data, 26, 13) + GPST_BDT_W;
+                update_week_tow(ch, getbitu(data, 26, 13) + GPST_BDT_W, tow);
+            } else {
+                update_tow(ch, tow);
             }
-            update_tow(ch, getbitu(data, 6, 20) + TOFF_B2BI + GPST_BDT);
         } else { // PPP-B2b
             ch->tow = (int)((TOFF_B2BI + GPST_BDT) / 1e-3);
             ch->tow_v = 2;
@@ -2027,8 +2081,8 @@ static void decode_IRNV1(sdr_ch_t *ch, const uint8_t *syms, int rev, int toi)
         ch->nav->seq = toi;
         ch->nav->nerr = nerr1 + nerr2;
         sdr_pack_bits(bits, 883, 0, data);
-        ch->week = getbitu(data, 9, 13) + GPST_IRT_W;
-        update_tow(ch, getbitu(data, 22, 8) * 7200.0 + toi * 18.0 + TOFF_I1SD);
+        update_week_tow(ch, getbitu(data, 9, 13) + GPST_IRT_W,
+            getbitu(data, 22, 8) * 7200.0 + toi * 18.0 + TOFF_I1SD);
         ch->nav->type = getbitu(data, 609, 6); // L1-SPS SF3 ID
         memcpy(ch->nav->data, data, 111); // L1-SPS SF1+SF2+SF3 (9+600+274 bits)
         ch->nav->stat = 1;

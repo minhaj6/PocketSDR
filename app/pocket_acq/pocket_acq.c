@@ -202,17 +202,13 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
             sig = argv[++i];
-        }
-        else if (!strcmp(argv[i], "-prn") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-prn") && i + 1 < argc) {
             nprn = sdr_parse_nums(argv[++i], prns);
-        }
-        else if (!strcmp(argv[i], "-tint") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-tint") && i + 1 < argc) {
             T = atof(argv[++i]) * 1e-3;
-        }
-        else if (!strcmp(argv[i], "-toff") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-toff") && i + 1 < argc) {
             toff = atof(argv[++i]) * 1e-3;
-        }
-        else if (!strcmp(argv[i], "-fmt") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-fmt") && i + 1 < argc) {
             const char *format = argv[++i];
             if      (!strcmp(format, "INT8"  )) fmt = SDR_FMT_INT8;
             else if (!strcmp(format, "INT8X2")) fmt = SDR_FMT_INT8X2;
@@ -226,30 +222,22 @@ int main(int argc, char **argv)
                 fprintf(stderr, "unrecognized format: %s\n", format);
                 exit(-1);
             }
-        }
-        else if (!strcmp(argv[i], "-f") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-f") && i + 1 < argc) {
             fs = atof(argv[++i]) * 1e6;
-        }
-        else if (!strcmp(argv[i], "-fi") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-fi") && i + 1 < argc) {
             fi = atof(argv[++i]) * 1e6;
             if (fi != 0.0) IQ = 1;
-        }
-        else if (!strcmp(argv[i], "-w") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-w") && i + 1 < argc) {
             fftw_wisdom = argv[++i];
-        }
-        else if (!strcmp(argv[i], "-d") && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "-d") && i + 1 < argc) {
             sscanf(argv[++i], "%lf,%lf", &ref_dop, &max_dop);
-        }
-        else if (!strcmp(argv[i], "-nz")) {
+        } else if (!strcmp(argv[i], "-nz")) {
             opt[2] = 1;
-        }
-        else if (!strcmp(argv[i], "-v")) {
+        } else if (!strcmp(argv[i], "-v")) {
             print_ver();
-        }
-        else if (argv[i][0] == '-') {
+        } else if (argv[i][0] == '-') {
             show_usage();
-        }
-        else {
+        } else {
             file = argv[i];
         }
     }
@@ -272,7 +260,7 @@ int main(int argc, char **argv)
     // read tag file
     double fo[SDR_MAX_RFCH];
     int IQ_t[SDR_MAX_RFCH], bits_t[SDR_MAX_RFCH];
-    if (sdr_tag_read(file, NULL, NULL, &fmt, &fs, fo, IQ_t, bits_t)) {
+    if (sdr_tag_read(file, NULL, NULL, &fmt, NULL, &fs, fo, IQ_t, bits_t) > 0) {
         if (fmt != SDR_FMT_INT8 && fmt != SDR_FMT_INT8X2 &&
             fmt != SDR_FMT_CS8 && fmt != SDR_FMT_CS16) {
             fprintf(stderr, "Unsupported format: %s\n", file);

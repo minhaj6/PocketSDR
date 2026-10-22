@@ -137,13 +137,76 @@ static void test_sdr_pvt_udobs_init_epoch_api(void)
     
     setup_channel(&ch, &trk, &nav);
     pvt->ix = 0;
-    
+
+    // an uncorroborated week only becomes the candidate
     sdr_pvt_udobs(pvt, ix, &ch);
-    
+
+    TEST_ASSERT_EQ_INT(0, (int)pvt->ix);
+    TEST_ASSERT_EQ_INT(ch.week, pvt->week_c);
+    TEST_ASSERT_EQ_INT(SDR_SYNC_UNKNOWN, pvt->sync);
+
+    // the same week from another channel initializes the epoch
+    ch.no = 3;
+    sdr_pvt_udobs(pvt, ix, &ch);
+
     TEST_ASSERT_TRUE(pvt->ix > 0);
     TEST_ASSERT_EQ_INT(0, pvt->obs->n);
     TEST_ASSERT_EQ_INT(0, pvt->nch);
+    TEST_ASSERT_EQ_INT(SDR_SYNC_COARSE, pvt->sync);
     
+    sdr_pvt_free(pvt);
+    cleanup_files();
+}
+
+// test last fix inherited from the nav data file regardless of the CPU time ---
+static void test_sdr_pvt_last_fix_api(void)
+{
+    sdr_rcv_t rcv;
+    sdr_pvt_t *pvt;
+    gtime_t time = gpst2time(2300, 345600.0); // far from the CPU time
+    FILE *fp;
+    
+    cleanup_files();
+    fp = fopen(NAVDATA_FILE, "w");
+    TEST_ASSERT_TRUE(fp != NULL);
+    fprintf(fp, "POS,%ld,%.9f,%.4f,%.4f,%.4f,%.14E,%.14E\n", (long)time.time,
+        time.sec, -3961904.9, 3348993.8, 3698211.6, 1.5e-4, -2.5e-7);
+    fclose(fp);
+    memset(&rcv, 0, sizeof(rcv));
+    pvt = sdr_pvt_new(&rcv);
+    
+    TEST_ASSERT_EQ_INT(1, pvt->last_valid);
+    TEST_ASSERT_NEAR(-3961904.9, pvt->last_rr[0], 1e-3);
+    TEST_ASSERT_NEAR(3698211.6, pvt->last_rr[2], 1e-3);
+    TEST_ASSERT_NEAR(-2.5e-7, pvt->last_dtrd, 1e-15);
+    TEST_ASSERT_NEAR(0.0, timediff(pvt->last_time, time), 1e-6);
+    TEST_ASSERT_EQ_INT(SDR_SYNC_UNKNOWN, pvt->sync);
+
+    sdr_pvt_free(pvt);
+    cleanup_files();
+}
+
+// test sdr_pvt_udobs() epoch initialization by a repeated week ----------------
+static void test_sdr_pvt_udobs_init_epoch_rep_api(void)
+{
+    sdr_rcv_t rcv;
+    sdr_pvt_t *pvt = new_test_pvt(&rcv);
+    sdr_ch_t ch;
+    sdr_trk_t trk;
+    sdr_nav_t nav;
+    int64_t ix = 100000;
+
+    setup_channel(&ch, &trk, &nav);
+    pvt->ix = 0;
+
+    // a single channel initializes the epoch once its week is confirmed
+    sdr_pvt_udobs(pvt, ix, &ch);
+    TEST_ASSERT_EQ_INT(0, (int)pvt->ix);
+
+    ch.nav->week_n = 2;
+    sdr_pvt_udobs(pvt, ix, &ch);
+    TEST_ASSERT_TRUE(pvt->ix > 0);
+
     sdr_pvt_free(pvt);
     cleanup_files();
 }
@@ -231,6 +294,77 @@ static void test_sdr_pvt_udnav_api(void)
     cleanup_files();
 }
 
+// pack GPS/QZS LNAV subframes 1-3 with ephemeris fields -----------------------
+static void pack_gps_lnav_eph(uint8_t *data, int week, double toes, int iode)
+{
+    uint32_t tow = (uint32_t)(toes / 6.0), toc = (uint32_t)(toes / 16.0);
+    int i;
+
+    memset(data, 0, 90);
+    i = 240 * 0 + 24;                          // subframe 1
+    setbitu(data, i, 17, tow);       i += 17 + 2;
+    setbitu(data, i,  3, 1);         i += 3 + 2;
+    setbitu(data, i, 10, week);      i += 10 + 2 + 4 + 6;
+    setbitu(data, i,  2, iode >> 8); i += 2 + 1 + 87 + 8;
+    setbitu(data, i,  8, iode);      i += 8;
+    setbitu(data, i, 16, toc);
+
+    i = 240 * 1 + 24;                          // subframe 2
+    setbitu(data, i, 17, tow);       i += 17 + 2;
+    setbitu(data, i,  3, 2);         i += 3 + 2;
+    setbitu(data, i,  8, iode);      i += 8 + 16 + 16 + 32 + 16 + 32 + 16 + 32;
+    setbitu(data, i, 16, toc);
+
+    i = 240 * 2 + 24;                          // subframe 3
+    setbitu(data, i, 17, tow);       i += 17 + 2;
+    setbitu(data, i,  3, 3);         i += 3 + 2 + 16 + 32 + 16 + 32 + 16 + 32 + 24;
+    setbitu(data, i,  8, iode);
+}
+
+// test adjgpsweek() nearest-era unwrapping ------------------------------------
+static void test_adjgpsweek_nearest_era(void)
+{
+    int w, week;
+
+    (void)time2gpst(utc2gpst(timeget()), &w);
+    if (w < 1560) w = 1560;
+
+    for (week = 0; week < 1024; week += 31) {
+        int adj = adjgpsweek(week);
+        TEST_ASSERT_EQ_INT(week, adj % 1024);
+        TEST_ASSERT_TRUE(adj - w >= -511 && adj - w <= 512);
+    }
+}
+
+// test sdr_pvt_udnav() GPS LNAV week rebase -----------------------------------
+static void test_sdr_pvt_udnav_gps_week(void)
+{
+    sdr_rcv_t rcv;
+    sdr_pvt_t *pvt = new_test_pvt(&rcv);
+    sdr_ch_t ch;
+    sdr_trk_t trk;
+    sdr_nav_t nav;
+    int sat = satid2no("G01");
+    gtime_t toe;
+
+    setup_channel(&ch, &trk, &nav);
+    ch.week = 390 + 2048; // signal-derived week (SF1 WN + GPST_OFF_W)
+    ch.nav->type = 3;
+    pack_gps_lnav_eph(ch.nav->data, 390, 36000.0, 17);
+
+    sdr_pvt_udnav(pvt, &ch);
+
+    TEST_ASSERT_EQ_INT(1, pvt->count[2]);
+    TEST_ASSERT_EQ_INT(2438, pvt->nav->eph[sat-1].week);
+    toe = gpst2time(2438, 36000.0);
+    TEST_ASSERT_NEAR(0.0, timediff(pvt->nav->eph[sat-1].toe, toe), 1e-9);
+    TEST_ASSERT_NEAR(0.0, timediff(pvt->nav->eph[sat-1].toc, toe), 1e-9);
+    TEST_ASSERT_NEAR(0.0, timediff(pvt->nav->eph[sat-1].ttr, toe), 1e-9);
+
+    sdr_pvt_free(pvt);
+    cleanup_files();
+}
+
 // test sdr_pvt_udsol() --------------------------------------------------------
 static void test_sdr_pvt_udsol_api(void)
 {
@@ -264,9 +398,13 @@ int main(void)
     TEST_RUN(test_sdr_pvt_new_free_api);
     TEST_RUN(test_sdr_pvt_solstr_api);
     TEST_RUN(test_sdr_pvt_udobs_init_epoch_api);
+    TEST_RUN(test_sdr_pvt_udobs_init_epoch_rep_api);
+    TEST_RUN(test_sdr_pvt_last_fix_api);
     TEST_RUN(test_sdr_pvt_udobs_update_api);
     TEST_RUN(test_sdr_pvt_udobs_invalid_api);
     TEST_RUN(test_sdr_pvt_udnav_api);
+    TEST_RUN(test_adjgpsweek_nearest_era);
+    TEST_RUN(test_sdr_pvt_udnav_gps_week);
     TEST_RUN(test_sdr_pvt_udsol_api);
     cleanup_files();
     return 0;

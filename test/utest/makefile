@@ -6,6 +6,7 @@
 
 USE_FFTW ?= 0
 USE_AVX2 ?= 1
+USE_AVX512 ?= 0
 
 SRC = ../../src
 LIB = ../../lib
@@ -27,7 +28,8 @@ TESTS = \
     test_sdr_pvt \
     test_sdr_rcv \
     test_sdr_sdev \
-    test_sdr_usb
+    test_sdr_usb \
+    test_sdr_web
 
 PERF_TESTS = \
     test_sdr_perf
@@ -65,7 +67,9 @@ ifeq ($(OS),Windows_NT)
     LDFLAGS += -Wl,--gc-sections
     SYS_LIBS += -lwinmm -lws2_32
     STATIC_OPT = -static
-    ifeq ($(USE_AVX2),1)
+    ifeq ($(USE_AVX512),1)
+        OPTIONS += -DAVX512 -mavx512f -mavx512bw -mavx512vl -mavx512vnni
+    else ifeq ($(USE_AVX2),1)
         OPTIONS += -DAVX2 -mavx2 -mfma
     endif
 else ifeq ($(UNAME_S),Darwin)
@@ -74,7 +78,10 @@ else ifeq ($(UNAME_S),Darwin)
     SYS_LIBS += -lpthread
     ifeq ($(UNAME_M),arm64)
         INCLUDE += -I/opt/homebrew/include
+        LDFLAGS += -L/opt/homebrew/lib
         OPTIONS += -DNEON
+    else ifeq ($(USE_AVX512),1)
+        OPTIONS += -DAVX512 -mavx512f -mavx512bw -mavx512vl -mavx512vnni
     else ifeq ($(USE_AVX2),1)
         OPTIONS += -DAVX2 -mavx2 -mfma
     endif
@@ -82,7 +89,9 @@ else
     LDFLAGS += -Wl,--gc-sections
     SYS_LIBS += -lm -lpthread
     ifeq ($(UNAME_M),aarch64)
-        OPTIONS += -DNEON
+        OPTIONS += -DNEON -mcpu=native
+    else ifeq ($(USE_AVX512),1)
+        OPTIONS += -DAVX512 -mavx512f -mavx512bw -mavx512vl -mavx512vnni
     else ifeq ($(USE_AVX2),1)
         OPTIONS += -DAVX2 -mavx2 -mfma
     endif
@@ -100,6 +109,9 @@ CFLAGS = -O2 -g $(INCLUDE) $(WARNOPT) $(OPTIONS) \
          -ffunction-sections -fdata-sections
 
 LDLIBS = $(STATIC_OPT) $(LIB_DIR)/librtk.a $(FFT_LIBS) $(SYS_LIBS)
+
+# relink when a linked library is rebuilt (the sources are compiled directly)
+LIBDEP = $(filter %.a,$(LDLIBS))
 
 TARGETS = $(addsuffix $(EXE),$(TESTS))
 PERF_TARGETS = $(addsuffix $(EXE),$(PERF_TESTS))
@@ -133,6 +145,8 @@ SRC_test_sdr_pvt      = $(SRC)/sdr_pvt.c $(SRC)/sdr_func.c \
                         $(STUB_RCV) $(SRC)/sdr_cmn.c
 SRC_test_sdr_perf     = $(SRC)/sdr_func.c $(SRC)/sdr_code.c \
                         $(SRC)/sdr_code_gal.c $(SRC)/sdr_array.c \
+                        $(SRC)/sdr_ch.c $(SRC)/sdr_nav.c $(SRC)/sdr_fec.c \
+                        $(SRC)/sdr_ldpc.c $(SRC)/sdr_nb_ldpc.c \
                         $(SRC)/sdr_cmn.c
 SRC_test_sdr_rcv      = $(SRC)/sdr_rcv.c $(SRC)/sdr_ch.c $(SRC)/sdr_nav.c \
                         $(SRC)/sdr_code.c $(SRC)/sdr_code_gal.c \
@@ -143,6 +157,14 @@ SRC_test_sdr_rcv      = $(SRC)/sdr_rcv.c $(SRC)/sdr_ch.c $(SRC)/sdr_nav.c \
                         $(STUB_USB) $(SRC)/sdr_cmn.c
 SRC_test_sdr_sdev     = $(STUB_SDEV) $(SRC)/sdr_cmn.c
 SRC_test_sdr_usb      = $(STUB_USB) $(SRC)/sdr_cmn.c
+SRC_test_sdr_web      = $(SRC)/sdr_web.c $(SRC)/sdr_rcv.c $(SRC)/sdr_ch.c \
+                        $(SRC)/sdr_nav.c $(SRC)/sdr_code.c \
+                        $(SRC)/sdr_code_gal.c $(SRC)/sdr_func.c \
+                        $(SRC)/sdr_array.c $(SRC)/sdr_pvt.c \
+                        $(SRC)/sdr_conf.c $(SRC)/sdr_fec.c \
+                        $(SRC)/sdr_ldpc.c $(SRC)/sdr_nb_ldpc.c \
+                        $(STUB_DEV) $(STUB_SDEV) $(STUB_USB) \
+                        $(SRC)/sdr_cmn.c
 
 CFLAGS_test_sdr_perf  = -O3 $(filter-out -O2,$(CFLAGS))
 CFLAGS_test_sdr_ch    = $(CFLAGS) -DSDR_CH_TEST
@@ -151,7 +173,7 @@ CFLAGS_test_sdr_nav   = $(CFLAGS) -DSDR_NAV_TEST
 all: $(TARGETS)
 
 define BUILD_TEST
-$(1)$(EXE): $(TEST_SRC)/$(1).c $$(SRC_$(1)) $(TEST_SRC)/test_sdr.h
+$(1)$(EXE): $(TEST_SRC)/$(1).c $$(SRC_$(1)) $(TEST_SRC)/test_sdr.h $(LIBDEP)
 	$(CC) $$(or $$(CFLAGS_$(1)),$$(CFLAGS)) $(LDFLAGS) -o $$@ $(TEST_SRC)/$(1).c $$(SRC_$(1)) $(LDLIBS)
 endef
 
@@ -168,6 +190,6 @@ perf: test_sdr_perf$(EXE)
 	./test_sdr_perf$(EXE)
 
 clean:
-	rm -rf build
+	rm -rf build test_sdr_web_html
 	rm -f $(TARGETS) $(PERF_TARGETS) sdr_func_c_test sdr_func_c_test.exe \
 	    $(TESTS) $(PERF_TESTS) *.o *.stackdump

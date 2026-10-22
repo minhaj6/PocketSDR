@@ -1,7 +1,7 @@
 ﻿# Pocket SDR GNSS SDR Algorithm Description
 
 <div style="text-align: right;">
-<strong>ver.0.17  2026-06-17</strong>
+<strong>ver.0.21  2026-10-21</strong>
 </div>
 
 ---
@@ -226,9 +226,13 @@ and code states by the elapsed time from the previous channel update.
 After input conversion, the receiver stores IF samples as `sdr_cpx8_t`. The
 sample values are compact signed integer I/Q pairs, not floating-point complex
 samples. Carrier wipeoff converts the compact buffer into `sdr_cpx16_t` working
-samples for correlation. Correlator outputs are accumulated in `sdr_cpx_t`,
-which is the floating-point complex type used by the FFT and loop
-discriminators.
+samples. In the standard correlator this conversion is fused with the
+correlation itself: each cache-sized chunk is carrier-wiped and immediately
+correlated, so no full-length baseband buffer is written. The L6 CSK path
+(`L6D`/`L6E`) and the complex-code path (`E5ABQ`) still convert a full code
+period into a `sdr_cpx16_t` working buffer. Correlator outputs are accumulated
+in `sdr_cpx_t`, which is the floating-point complex type used by the FFT and
+loop discriminators.
 
 This representation is central to the implementation. It reduces memory
 bandwidth in the circular buffers, keeps lookup-table unpacking cheap, and
@@ -589,9 +593,13 @@ Fast-search aiding can request a wider assisted window by setting `fd_ext_n`;
 the same bin spacing is then used across the requested number of bins around
 `fd_ext`.
 
-The receiver accumulates non-coherent correlation power until
-`n_sum * T >= sdr_t_acq` (default `20 ms`). It then searches the Doppler/code
-grid for the maximum power and estimates C/N0 from the peak-to-average ratio:
+The receiver distinguishes normal and Doppler-assisted searches with
+`fd_ext_valid`, so an exact zero-Hz Doppler aid is valid. Normal acquisition
+accumulates until `n_sum * T >= sdr_t_acq` (default `20 ms`). Assisted
+acquisition uses `sdr_t_acq_ext` (default `100 ms`) because its much smaller
+Doppler search space makes longer integration affordable. It then searches the
+Doppler/code grid for the maximum power and estimates C/N0 from the
+peak-to-average ratio:
 
 $$
 C/N_0 =
@@ -601,8 +609,16 @@ C/N_0 =
 )
 $$
 
-If the result exceeds the lock threshold (`sdr_thres_cn0_l`, default
-`34 dB-Hz`), tracking starts with the detected Doppler and code offset.
+For normal acquisition, tracking starts if the result exceeds
+`sdr_thres_cn0_l` (default `34 dB-Hz`). An assisted search instead uses
+
+$$
+\max(C/N_{0,\mathrm{ext}}, C/N_{0,\mathrm{lost}} + 1\ \mathrm{dB})
+$$
+
+where `sdr_thres_cn0_ext` defaults to `30 dB-Hz`, and the lost threshold is
+`sdr_thres_cn0_u` or the L6-specific threshold. The margin prevents immediate
+loss caused by the C/N0 gate; PLI and loop-dynamic limits remain separate.
 Otherwise the channel returns to idle.
 
 ### 3.4 Special Acquisition Cases
@@ -611,9 +627,9 @@ Otherwise the channel returns to idle.
 can be found before secondary-code alignment is known. The full E5aQ/E5bQ
 pilot combination is used later in tracking after secondary-code sync.
 
-Long or CSK-like signals such as QZSS `L6D` and `L6E` use FFT correlation in
-the tracking path as well, because their code and CSK symbol structure make a
-full code-phase correlation useful after lock.
+QZSS `L6D` and `L6E` acquire like ordinary signals, but their CSK symbol
+structure also requires a code-shift search after lock; tracking runs a
+separate small chip-domain FFT correlation for that purpose (see 4.16).
 
 ### 3.5 Acquisition State Data
 
@@ -625,6 +641,8 @@ The acquisition state is stored in `sdr_acq_t`:
 | `fds` | Normal Doppler search bin list |
 | `len_fds` | Number of Doppler bins |
 | `fd_ext` | Optional external Doppler assistance |
+| `fd_ext_valid` | Validity flag for `fd_ext`, including an exact 0 Hz aid |
+| `fd_ext_n` | Assisted Doppler-bin count (0 selects the default three bins) |
 | `P_sum` | Non-coherent sum of correlation powers |
 | `n_sum` | Number of coherent code-period searches accumulated |
 
@@ -675,7 +693,7 @@ and satellite Doppler are common between frequencies to first order.
 Each call to `sdr_search_code()` performs one coherent code-period correlation
 for every Doppler bin. The coherent result is converted to power and added to
 `P_sum`. After enough calls, the non-coherent integration interval reaches
-`sdr_t_acq`.
+`sdr_t_acq` for a normal search or `sdr_t_acq_ext` for an assisted search.
 
 The distinction is:
 
@@ -708,7 +726,8 @@ with the receiver's tracking threshold and status display.
 
 The acquisition decision has two outputs:
 
-- if `cn0 >= sdr_thres_cn0_l`, the channel starts tracking;
+- if `cn0` reaches the effective normal or assisted threshold, the channel
+  starts tracking;
 - otherwise the channel sleeps briefly, returns to idle, and may be searched
   again later by the scheduler.
 
@@ -740,7 +759,8 @@ than the discrete bin center and reduces the FLL pull-in burden.
 The implemented acquisition loop for one channel can be expressed as:
 
 ```text
-if external Doppler is available:
+assisted = fd_ext_valid
+if assisted:
     if fd_ext_n is set:
         fds = fd_ext-centered bins with fd_ext_n entries at 0.5/T spacing
     else:
@@ -754,7 +774,11 @@ if P_sum is not allocated:
 sdr_search_code(code_fft, T, buffer, ix, 2N, fs, fi, fds, P_sum)
 n_sum += 1
 
-if n_sum * T >= sdr_t_acq:
+T_acq = sdr_t_acq_ext if assisted else sdr_t_acq
+threshold = max(sdr_thres_cn0_ext, lost_threshold + 1) if assisted
+            else sdr_thres_cn0_l
+
+if n_sum * T >= T_acq:
     cn0, fd_index, code_index = peak_search(P_sum)
     if cn0 >= threshold:
         fd = fine_doppler(P_sum, fd_index)
@@ -826,8 +850,10 @@ Data Flow of Signal Tracking
 
 At channel creation, the receiver builds a tracking replica bank. For ordinary
 real spreading codes, the code is resampled at `fs` for `SDR_N_CODES = 10`
-fractional code phases. Each tracking epoch selects the bank corresponding to
-the current fractional code offset.
+fractional code phases and stored as 1-byte `int8_t` samples (values -1/0/1),
+which halves the bank footprint compared to a complex representation. Each
+tracking epoch selects the bank corresponding to the current fractional code
+offset.
 
 The default correlator positions are:
 
@@ -836,10 +862,13 @@ The default correlator positions are:
 - noise correlator `N`, located far away at a fixed sample offset;
 - optional very-early and very-late correlators for BOC false-lock detection.
 
-For most signals, tracking uses the time-domain standard correlator. The IF
-samples are carrier-wiped, then correlated with prompt, early, late, noise, and
-optional BOC monitor replicas. The correlator splits the code period at the code
-wrap point and detects a polarity flip between the two halves, which reduces
+For most signals, tracking uses the time-domain standard correlator with fused
+carrier wipeoff: the IF samples are carrier-wiped and correlated with prompt,
+early, late, noise, and optional BOC monitor replicas chunk by chunk in a
+single pass, which keeps the working samples in cache and avoids re-reading a
+full-length baseband buffer for each correlator. The correlator splits the
+code period at the code wrap point and detects a polarity flip between the two
+halves, which reduces
 the impact of data-bit transitions inside the integration interval. The
 correlator logic, including the cross-epoch combination of the two halves, is
 shown in the figure below (detailed in §4.10–§4.11).
@@ -849,8 +878,10 @@ between three precomputed banks: E5aQ only before secondary-code sync, and two
 E5aQ/E5bQ pilot combinations after sync depending on the relative secondary
 code polarity.
 
-For `L6D` and `L6E`, tracking uses FFT correlation and then detects the CSK
-symbol from the peak displacement around the prompt region.
+For `L6D` and `L6E`, the CSK symbol is detected by a chip-domain FFT
+correlation over the candidate code shifts, and the correlator outputs are
+then produced by the standard correlator against the CSK-shifted code
+(see 4.16).
 
 <br>
 <div style="text-align: center;">
@@ -881,8 +912,10 @@ Carrier tracking uses a pull-in FLL followed by a PLL.
 During the first `T_FPULLIN = 1.0 s`, an FLL discriminator compares the current
 and previous prompt correlations using dot and cross products. It uses a wide
 bandwidth first, then a narrow bandwidth. After pull-in, a third-order PLL is
-used. For data-bearing signals the carrier discriminator is Costas-style; for
-non-Costas cases it uses the full `atan2` phase.
+used. The normal path uses the channel's Costas/non-Costas discriminator every
+code period. A supported pilot switches to secondary-code-wiped coherent
+prompt sums and a four-quadrant `atan2` discriminator after secondary-code
+sync, as detailed in 4.13.
 
 ### 4.4 Code Tracking
 
@@ -912,18 +945,24 @@ secondary-code polarity is removed from all correlator outputs. If the average
 prompt magnitude falls below a loss threshold at a secondary-code boundary,
 sync is cleared.
 
-C/N0 is estimated every `T_CN0 = 0.5 s` from prompt power and the noise
-correlator:
+C/N0 is estimated every `T_CN0 = 0.5 s` from prompt power and the displaced
+noise correlator. The noise power contained in the prompt is subtracted before
+conversion to dB-Hz:
 
 $$
-C/N_0 =
+\begin{aligned}
+P_S &= \max(P_{\mathrm{prompt}}-P_{\mathrm{noise}},
+             0.01P_{\mathrm{noise}}) \\
+C/N_0 &=
 10\log_{10}
 (
-\frac{P_{\mathrm{prompt}}}{P_{\mathrm{noise}}\,T}
+\frac{P_S}{P_{\mathrm{noise}}\,T}
 )
+\end{aligned}
 $$
 
-The estimate is low-pass filtered.
+The 1% floor avoids a logarithm-domain error when the estimated signal power is
+zero or negative. The estimate is low-pass filtered.
 
 At the same `T_CN0` boundary the receiver also updates a carrier lock indicator
 (PLI), a squaring (Van Dierendonck) detector that is independent of received
@@ -932,17 +971,21 @@ power stays high:
 
 $$
 \mathrm{PLI} =
+\frac{\mathrm{sumD}}{\mathrm{sumPs}} =
 \frac{\sum (I_P^2 - Q_P^2)}{\sum (I_P^2 + Q_P^2)}
 \approx \cos 2\bar{\phi}
 $$
 
 PLI tends to `+1` under phase lock and to `0` when the carrier spins or there is
-only noise. It is computed only for Costas-tracked signals and becomes valid
-after the first `T_CN0` window.
+only noise. The normal path accumulates per-period prompts. A synchronized
+pilot accumulates the coherent prompt sums used by its PLL, so numerator and
+denominator always use the same integration interval. The loss detector uses
+PLI when `ch->costas` is set and it becomes valid after the first `T_CN0`
+window.
 
 Signal loss is decided once per `T_CN0` window (not every epoch). A window is
 flagged bad when the filtered C/N0 falls below the loss threshold
-(`sdr_thres_cn0_u`, `30 dB-Hz` normally, `33 dB-Hz` for L6) **or** the PLI of a
+(`sdr_thres_cn0_u`, `25 dB-Hz` normally, `32.5 dB-Hz` for L6) **or** the PLI of a
 Costas-tracked signal falls below `sdr_thres_pli`. A pessimistic counter
 debounces transients: the channel declares signal loss, returns to idle, and
 becomes eligible for re-acquisition only after `sdr_lost_th` consecutive bad
@@ -971,27 +1014,34 @@ The tracking state is stored in `sdr_trk_t`. Important fields are:
 | `err_phas`, `phas_acc` | PLL discriminator history and third-order accumulator |
 | `err_code`, `code_int` | DLL discriminator history and second-order integrator |
 | `sumP`, `sumN` | Prompt and noise power sums for C/N0 |
-| `sumD` | Prompt `I^2-Q^2` sum for the carrier lock indicator (PLI) |
+| `sumPs`, `sumD` | Matched prompt-power and `I^2-Q^2` sums for PLI |
+| `Cs`, `coh_n` | Coherent prompt sum and its epoch count for pilot tracking |
 | `sumC[]`, `sumI[]` | DLL accumulation buffers |
 | `code` | Resampled tracking code bank |
-| `code_fft` | FFT tracking code bank for L6 |
+| `code_fft` | Chip-domain extended-code FFT for L6 CSK detection |
+| `csk_ref` | L6 CSK code-shift reference after frame sync (-1: unset) |
 
 The channel object `sdr_ch_t` stores the loop state that must persist across
 epochs: Doppler, code offset, continuous carrier phase (`phi`), accumulated
 Doppler range, C/N0, carrier lock indicator (`pli`) and its valid flag,
 week/TOW, lock count, loss count and the loss-decision counter (`lost_cnt`),
-Costas/non-Costas mode, and navigation state.
+Costas/non-Costas mode, pilot classification, and navigation state.
 
-`start_track()` resets the dynamic tracking and navigation states. It does not
+`start_track()` resets the dynamic tracking and navigation states and
+initializes the carrier NCO phase on the common receiver time origin (§4.8).
+It does not
 regenerate codes or FFTs because those are permanent channel resources. This
 makes reacquisition cheap: the channel can move from idle to search to lock
 without rebuilding signal-specific resources.
 
 ### 4.8 Carrier Wipeoff Implementation
 
-Carrier wipeoff is performed by `sdr_mix_carr()`. The function accepts compact
-IF samples from an `sdr_buff_t`, a start index, a sample count, a sample rate,
-and a carrier frequency. It produces `sdr_cpx16_t` samples for the correlator.
+Carrier wipeoff is performed by `sdr_mix_carr()` or fused inside
+`sdr_corr_std()`. Both accept compact IF samples from an `sdr_buff_t`, a start
+index, a sample count, a sample rate, and a carrier frequency, and produce
+`sdr_cpx16_t` samples. `sdr_mix_carr()` writes them to a work buffer for the
+FFT correlator and the complex-code correlator; `sdr_corr_std()` consumes them
+chunk by chunk without materializing the full buffer.
 
 The phase passed into `sdr_mix_carr()` is expressed in cycles. The low-level
 implementation converts phase and frequency step to a fixed-point index into a
@@ -1014,6 +1064,20 @@ full carrier `f_c = f_i + f_d`, reduced to `[0, 1)` cycle each epoch by
 subtracting its floor (this keeps precision bounded; the mixer only needs the
 fractional phase). It is kept separate from `adr`, the Doppler-only accumulator
 used for the carrier-phase observable.
+
+At tracking start, `phi` is initialized to `frac(f_i * t)` on the common
+receiver time origin (`init_phi()`), not to zero. In lock the PLL drives `phi`
+to the incoming phase, so `adr = phi - f_i*(t - t0) - phi_0` would, with
+`phi_0 = 0`, carry the channel-dependent fractional bias `frac(f_i * t0)` set
+by the tracking start time `t0`. Start times lie on the 1 ms processing grid,
+so the bias cancels between satellites only when `f_i` is a multiple of 1 kHz;
+otherwise it breaks the integer nature of double-difference carrier-phase
+ambiguities and changes at every reacquisition (GitHub issue #97). Referencing
+all channels to the common time origin removes the `t0` dependence. To keep
+the initialization accurate over long runs, `f_i * t` is not formed as one
+double product: the millisecond count is split into integer seconds and
+residual milliseconds and the integer part of `f_i` is separated out, which
+bounds the error below 1e-7 cycle even after months of continuous operation.
 
 Accumulating `phi` continuously (rather than recomputing `f_i*tau + adr` per
 epoch) keeps the carrier coherent across code-period boundaries. This matters
@@ -1049,7 +1113,9 @@ navigation-symbol timing remain aligned.
 
 ### 4.10 Standard Correlator Details
 
-For ordinary signals, `sdr_corr_std()` forms correlations at the requested
+For ordinary signals, `sdr_corr_std()` wipes off the carrier and forms
+correlations at the requested positions in one fused pass: each cache-sized
+chunk of IF samples is mixed and immediately accumulated into all correlator
 positions. For each position, it splits the local code into two contiguous
 segments around the code wrap point:
 
@@ -1143,10 +1209,32 @@ source:
 $$
 \begin{aligned}
 W &= \frac{B_{\mathrm{PLL}}}{0.7845} \\
-a_{\phi} &\leftarrow a_{\phi} + W^3 e_{\phi} T \\
-f_d &\leftarrow f_d + 2.4W(e_{\phi}-e_{\phi,\mathrm{prev}}) + 1.1W^2 e_{\phi}T + a_{\phi}T
+\Delta t &= \text{PLL update interval} \\
+a_{\phi} &\leftarrow a_{\phi} + W^3 e_{\phi}\Delta t \\
+f_d &\leftarrow f_d + 2.4W(e_{\phi}-e_{\phi,\mathrm{prev}})
+    + 1.1W^2 e_{\phi}\Delta t + a_{\phi}\Delta t
 \end{aligned}
 $$
+
+For the normal path, `Delta t = T`. For a dataless pilot identified by
+`sdr_sig_pilot()`, secondary-code sync makes the wiped prompt polarity stable.
+The receiver sums
+
+$$
+C_S = \sum_{i=1}^{K} C_{P,i}, \qquad
+K = \max(1, \operatorname{round}(t_{\mathrm{coh}}/T))
+$$
+
+and updates the PLL with `atan2(Im(C_S), Re(C_S))` at
+`Delta t = K*T`. The supported set is L1CP, L5Q, L5SQ, G2OCP, G3OCP, E1C,
+E5AQ, E5ABQ, E5BQ, E6C, B1CP, B2AP and I1SP. If secondary-code sync is lost,
+the channel immediately clears the partial coherent sum and returns to the
+per-period path. If `sdr_b_pll * K * T >= 0.4`, the implementation also falls
+back to the per-period Costas path to avoid an unstable update interval.
+
+`sec_pol` resolves the current half-cycle branch for wipeoff; it is not the
+broadcast overlay sequence itself. Integer carrier ambiguity remains, and a
+polarity change after re-synchronization can cause a half-cycle discontinuity.
 
 The third-order loop can track constant acceleration in carrier phase better
 than a simple first-order or second-order loop. This is useful for live
@@ -1192,9 +1280,11 @@ removes residual code-phase bias.
 
 ### 4.15 Lock, Loss, and Thresholds
 
-The receiver has two C/N0 thresholds with different meanings:
+The receiver has three configurable C/N0 thresholds with different meanings:
 
 - `sdr_thres_cn0_l` is used to start lock after acquisition;
+- `sdr_thres_cn0_ext` is used for Doppler-assisted acquisition, subject to the
+  lost-threshold-plus-1-dB floor described in 3.3;
 - `sdr_thres_cn0_u` is used to declare loss during tracking.
 
 The loss threshold is lower than the acquisition threshold. This hysteresis is
@@ -1219,17 +1309,46 @@ the previous lock was long enough and recent enough.
 
 ### 4.16 L6 CSK Tracking
 
-QZSS L6 signals use code shift keying. In the tracking path, the receiver first
-carrier-wipes one code period and runs an FFT correlator with the selected L6
-code FFT. The CSK symbol is detected from the correlation peak location around
-the prompt region. The detected symbol is appended to the navigation symbol
-buffer.
+QZSS L6 signals use code shift keying: the 10230-chip code is cyclically
+shifted by the 8-bit symbol value each 4 ms symbol. On air, L6D and L6E are
+time-division multiplexed at twice the chip rate; each code chip consists of
+two sub-chip slots, with L6D occupying the even slot and L6E the odd slot.
 
-After CSK peak detection, the receiver interpolates correlator outputs at the
-prompt and loop-control positions so that FLL, PLL, DLL, and C/N0 update can
-reuse the same channel tracking structure. This keeps the external channel
-state similar to ordinary signals even though the symbol extraction is
-fundamentally different.
+Symbol detection and loop tracking are decoupled:
+
+1. One code period is carrier-wiped into the channel work buffer.
+2. `sdr_bin_csk()` accumulates the samples of the signal's TDM slot chip by
+   chip, applying the fractional code offset at the bin boundaries, producing
+   a 10230-chip complex sequence.
+3. The sequence is circularly correlated with the code by a fixed-size FFT
+   (`CSK_NFFT = 10800`) against a replica periodically extended by
+   `CSK_WIN = 280` chips on both sides, which yields the exact circular
+   correlation for every shift in the +/-280-chip window without wrap-around
+   aliasing. The peak over the candidate shifts gives the CSK shift, and the
+   symbol is appended to the navigation symbol buffer.
+4. The E/P/L/N correlator outputs are produced by the standard time-domain
+   correlator with the detected shift added to the code offset, so FLL, PLL,
+   DLL, and C/N0 operate on true (non-interpolated) correlations of the
+   CSK-shifted code. The standard correlator is called with fixed code
+   polarity (`pol = 1`): the L6 window is symbol-aligned and circular, so no
+   data-bit flip can occur at the code wrap-around, and the normal flip
+   detector would fire randomly whenever one partial correlation is
+   noise-dominated.
+
+Because the correlation FFT size is fixed, the symbol-detection cost is
+independent of the sampling rate; only carrier wipeoff, chip binning, and the
+standard correlator scale with `fs`.
+
+Before frame synchronization, the code-phase reference established at
+acquisition is offset by the unknown symbol transmitted during acquisition, so
+the peak search covers shifts in [-255, +255]. This window contains each
+symbol value twice: shifts `s` and `s - 256` decode to the same symbol, but
+only one of them places the loop correlators on the true peak. Once the L6
+navigation decoder achieves frame sync and recovers the constant symbol
+offset (stored in `nav->coff`), the channel anchors `trk->csk_ref` and
+narrows the search to the 256 shifts `[csk_ref - 255, csk_ref]`, eliminating
+the alias candidates. The anchor is cleared when frame sync is lost, so a
+wrong anchor self-heals within one frame.
 
 ### 4.17 E5 AltBOC Tracking
 
@@ -1273,11 +1392,14 @@ if secondary code can be synchronized:
 
 if inside pull-in time:
     run FLL
+else if synchronized supported pilot and b_pll * K * T < 0.4:
+    sum K secondary-code-wiped prompts
+    run atan2 PLL every K periods with dt = K * T
 else:
-    run PLL
+    run per-period Costas/non-Costas PLL with dt = T
 
 run DLL
-update C/N0
+update noise-subtracted C/N0 and matched-interval PLI
 
 if navigation pull-in reached:
     decode navigation data
@@ -1481,10 +1603,11 @@ SF2, and SF3 data into the channel navigation buffer. `L1CP` is the matching
 pilot path and obtains ambiguous timing from secondary-code sync.
 
 QZSS L6 `L6D` and `L6E` are decoded from CSK symbols. The tracking path
-detects the CSK shift and appends symbols; the navigation decoder then handles
-L6 frame structure and LDPC/error checks. These signals are also treated
-specially in tracking because correlation over all code shifts is needed to
-recover the CSK symbol.
+detects the CSK shift and appends symbols; the navigation decoder then
+synchronizes the frame on preamble differences, recovers the constant symbol
+offset, and checks the Reed-Solomon code. After frame sync, the recovered
+symbol offset (`nav->coff`) is also fed back to tracking to narrow the CSK
+peak search (see 4.16).
 
 ### 5.6 GLONASS Paths
 
@@ -1729,6 +1852,12 @@ Additional half-cycle and quarter-cycle corrections are then applied:
 - several signals require fixed quarter-cycle phase alignment corrections;
 - some BeiDou GEO/IGSO/MEO legacy paths require additional half-cycle handling.
 
+The fractional part of `L` is aligned across channels: the carrier NCO phase
+is initialized on the common receiver time origin at tracking start (§4.8), so
+`L` carries no start-time dependent fractional bias and between-satellite
+differences preserve the integer nature of double-difference ambiguities even
+when the modeled IF frequency is not an integer multiple of 1 kHz.
+
 The result is a carrier-phase observable in cycles. It is not ambiguity-fixed;
 it is a continuous tracking observable with possible loss-of-lock indicators.
 The PVT solver in this receiver path uses pseudorange for single-point
@@ -1898,11 +2027,13 @@ resampling the spreading code during tracking.
 
 Acquisition uses FFT correlation over all code phases for each Doppler bin.
 Tracking uses time-domain dot products for normal short-code tracking, which is
-cheaper than FFT when only a few correlator taps are needed. L6 uses FFT
-correlation in tracking because the CSK symbol is encoded as a code-phase shift.
+cheaper than FFT when only a few correlator taps are needed. L6 additionally
+runs a small fixed-size chip-domain FFT each symbol to search the CSK
+code-phase shift; its E/P/L correlations use the time-domain correlator like
+any other signal.
 
-The low-level carrier mixer and correlator include AVX2 and NEON paths where
-available. Complex samples and code replicas are stored in compact integer
+The low-level carrier mixer and correlator include AVX2, AVX-512 and NEON paths
+where available. Complex samples and code replicas are stored in compact integer
 formats so the hot loops can use vector integer operations.
 
 ### 7.5 Search Load Control and Doppler Assistance
@@ -1924,7 +2055,9 @@ The hot-path memory layout is chosen to reduce copies and cache pressure:
 
 - raw input is read into a temporary byte buffer for one 1 ms receiver cycle;
 - unpacked IF samples are written directly into RF-channel circular buffers;
-- carrier-wiped samples are produced into a channel-local work buffer;
+- carrier-wiped samples are consumed chunk by chunk inside the standard
+  correlator; only the L6 CSK and complex-code paths produce them into a
+  channel-local work buffer;
 - code replicas are precomputed in channel-local contiguous banks;
 - correlator outputs are small fixed arrays in the tracking state;
 - prompt history is a fixed rolling array rather than a dynamically growing
@@ -1951,11 +2084,12 @@ sampling mode.
 
 ### 7.9 FFTW and FFT Abstraction
 
-The FFT helper `sdr_cpx_fft()` hides the FFT implementation. Acquisition and L6
-tracking use it through `sdr_corr_fft()`. The codebase also supports FFTW
-wisdom generation and loading in the wider Pocket SDR toolchain. In the
-receiver path, the main algorithmic point is that code FFTs are generated once,
-while data FFTs are generated for each Doppler bin or each L6 tracking epoch.
+The FFT helper `sdr_cpx_fft()` hides the FFT implementation. Acquisition uses
+it through `sdr_corr_fft()`, and L6 CSK tracking uses it directly for the
+fixed-size chip-domain correlation. The codebase also supports FFTW wisdom
+generation and loading in the wider Pocket SDR toolchain. In the receiver
+path, the main algorithmic point is that code FFTs are generated once, while
+data FFTs are generated for each Doppler bin or each L6 symbol.
 
 The PCPS acquisition complexity for one coherent integration is roughly:
 
@@ -1970,7 +2104,8 @@ and FFT correlation per bin.
 
 ### 7.10 SIMD Hot Paths
 
-The low-level functions include AVX2 and NEON blocks for two key operations:
+The low-level functions include AVX2, AVX-512 (`-DAVX512`, `USE_AVX512=1`) and
+NEON blocks for two key operations:
 
 - carrier mixing from compact IF samples to `sdr_cpx16_t`;
 - dot products between carrier-wiped samples and code replicas.
@@ -1981,8 +2116,16 @@ operations rather than general floating-point multiplication. The scalar loops
 remain as portable fallbacks.
 
 The implementation keeps the public algorithm independent of the SIMD path.
-Acquisition, tracking, and PVT behavior should not change when AVX2 or NEON is
-not available; only throughput changes.
+Acquisition, tracking, and PVT behavior should not change when AVX2, AVX-512 or
+NEON is not available; only throughput changes.
+
+The AVX-512 path differs from the AVX2 one in two points. The carrier mixer does
+not use the 64K-entry data x carrier LUT; it computes `(I + jQ)(cos - j sin)` in
+int16 lanes, 32 samples per iteration, with the 8-bit phase mapped to the
+carrier by a 256-entry LUT held in registers (`vpermi2w`). The correlator inner
+product uses the VNNI instruction `vpdpbusd` (u8 x s8 to int32) on 32 samples
+per instruction, and the tails are handled by masked loads so no scalar loop
+runs. Both are bit-identical to the scalar path.
 
 The two figures below show the AVX2 vectorization of the two hottest kernels,
 carrier mixing (`mix_carr()`) and the correlator inner product (`dot_IQ_code()`).
@@ -2024,9 +2167,10 @@ over a few taps is cheaper than an FFT over all code phases for each tracking
 epoch. This is why normal tracking uses `sdr_corr_std()` instead of
 `sdr_corr_fft()`.
 
-L6 is the exception because CSK data is encoded as a code-phase shift. The
-receiver must inspect a wide correlation region to find the symbol shift, so
-the FFT correlator remains useful in tracking.
+L6 also needs a wide correlation region each symbol because CSK data is
+encoded as a code-phase shift, but that search runs on chip-binned data with
+a small fixed-size FFT; the loop correlators still come from the time-domain
+correlator.
 
 ### 7.13 Avoiding Work in Idle Channels
 
@@ -2135,6 +2279,8 @@ they also define the receiver algorithm's practical behavior.
 | `SDR_N_HIST` | `5000` | Prompt-history length |
 | `SP_CORR` | `0.25 chip` | Early/late correlator spacing |
 | `T_ACQ` | `20 ms` | Acquisition non-coherent integration time |
+| `T_ACQ_EXT` | `100 ms` | Assisted-acquisition integration time |
+| `T_COH` | `20 ms` | Requested coherent pilot PLL interval |
 | `T_DLL` | `20 ms` | DLL non-coherent accumulation time |
 | `T_CN0` | `0.5 s` | C/N0 averaging interval |
 | `T_FPULLIN` | `1.0 s` | FLL pull-in duration before PLL |
@@ -2145,7 +2291,9 @@ they also define the receiver algorithm's practical behavior.
 | `B_FLL_N` | `2.0 Hz` | Narrow FLL bandwidth |
 | `MAX_DOP` | `5000 Hz` | Default acquisition Doppler search limit |
 | `THRES_CN0_L` | `34 dB-Hz` | Acquisition lock threshold |
-| `THRES_CN0_U` | `30 dB-Hz` | Tracking loss threshold |
+| `THRES_CN0_EXT` | `30 dB-Hz` | Assisted-acquisition threshold |
+| `THRES_CN0_U` | `25 dB-Hz` | Tracking loss threshold |
+| `THRES_CN0_L6` | `32.5 dB-Hz` | L6 tracking loss threshold |
 
 These values are tuned for a host-based software receiver. They balance
 sensitivity, CPU load, latency, and robustness. Increasing acquisition
@@ -2241,8 +2389,10 @@ ch_thread()
     -> sdr_ch_update()
         -> search_sig() if SRCH
         -> track_sig()  if LOCK
-            -> sdr_mix_carr()
-            -> sdr_corr_std() / sdr_corr_fft()
+            -> sdr_corr_std() (carrier mixing fused), or
+            -> sdr_mix_carr() -> sdr_corr_std_cpx_code() (E5ABQ), or
+            -> sdr_mix_carr() -> sdr_bin_csk() -> chip-domain FFT
+               -> sdr_corr_std() with CSK-shifted code (L6D/E)
             -> sync_sec_code()
             -> FLL() or PLL()
             -> DLL()
@@ -2293,7 +2443,7 @@ activate specialized behavior.
 | GLONASS FDMA legacy | PRN argument represents FCN; carrier frequency is shifted |
 | BOC-like signals | Optional bump-jump monitor taps |
 | Pilot signals | Timing may be secondary-code based and ambiguity-resolved |
-| `L6D`, `L6E` | FFT tracking and CSK symbol detection |
+| `L6D`, `L6E` | Chip-domain FFT CSK symbol detection, CSK-shifted E/P/L |
 | `E5ABQ` | E5aQ acquisition, AltBOC complex-code tracking banks |
 | GPS/QZSS CNAV-2 | LDPC decoding and known SF1 symbol-table sync |
 | Galileo I/NAV/F/NAV | Separate ephemeris ingestion paths |
@@ -2346,8 +2496,8 @@ may require one of these strategies:
 
 Special modulation may also require a complex local replica or a tracking
 correlator that searches more than prompt/early/late positions. `E5ABQ` and L6
-are examples of two different solutions: complex-code banks for AltBOC, and FFT
-tracking for CSK.
+are examples of two different solutions: complex-code banks for AltBOC, and a
+chip-domain FFT symbol search for CSK.
 
 ### E.3 Changing Loop Bandwidths
 
@@ -2517,17 +2667,24 @@ $$
 $$
 
 In tracking, the receiver has a prompt correlator and a deliberately displaced
-noise correlator. The prompt/noise power ratio is accumulated over 0.5 s:
+noise correlator. Their powers are accumulated over 0.5 s. The noise reference
+is subtracted from the prompt before forming the ratio:
 
 $$
+\begin{aligned}
+P_S &= \max\left(\sum |P|^2-\sum |N|^2,
+                  0.01\sum |N|^2\right) \\
 (C/N_0)_{\mathrm{trk}} =
 10\log_{10}
 (
-\frac{\sum |P|^2}{T\sum |N|^2}
+\frac{P_S}{T\sum |N|^2}
 )
+\end{aligned}
 $$
 
-Both are practical receiver metrics. They are not identical estimators and
+The subtraction removes the `10*log10(1/T)` low-C/N0 floor of the former
+prompt/noise ratio. Both are practical receiver metrics. They are not
+identical estimators and
 should not be expected to match exactly at lock transition. The acquisition
 metric is used for detection; the tracking metric is used for status and loss
 detection.
