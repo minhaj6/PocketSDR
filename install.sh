@@ -7,12 +7,16 @@
 #    binaries -> /usr/local/bin
 #    presets  -> /usr/local/share/pocketsdr/conf
 #    web UI   -> /usr/local/share/pocketsdr/html  (served by pocket_web)
-#
+#    man pages-> /usr/local/share/man/man1        (from doc/man, see
+#                                                  generate-man-pages.sh)
+# Author: Minhaj Ahmad <mahmad12@crimson.ua.edu>
+
 set -eu
 
 BINDIR=/usr/local/bin
 CONFDIR=/usr/local/share/pocketsdr/conf
 HTMLDIR=/usr/local/share/pocketsdr/html
+MANDIR=/usr/local/share/man/man1
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # install only copies binaries -- make sure they were built first.
@@ -42,6 +46,10 @@ $SUDO cp "$ROOT"/conf/*.conf "$CONFDIR"/
 # web UI files for pocket_web (replace, so files removed upstream go away)
 $SUDO rm -rf "$HTMLDIR"
 $SUDO cp -r "$ROOT/html" "$HTMLDIR"
+
+# man pages
+$SUDO mkdir -p "$MANDIR"
+$SUDO cp "$ROOT"/doc/man/*.1 "$MANDIR"/
 
 # bash completion (only if the bash-completion framework is installed)
 COMPDIR=/usr/share/bash-completion/completions

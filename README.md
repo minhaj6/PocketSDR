@@ -9,12 +9,17 @@
 
 ## Some thoughts regarding Minhaj's fork
 
-I am making some changes that make my life easier when configuring the pocketsdr front-ends and collecting data with them. Dr. Takasu has done an amazing job with this project. I don't intend to submit a pull request to the upstream as these changes may go against the design choices Dr. Takasu made and may not want it in his repo.
+I am making some changes that make my life easier when using pocketsdr front-ends and collecting data with them. Dr. Takasu has done an amazing job with this project. I don't have any plans to submit a pull request to the upstream as of now. 
 
-### List of changes
+This fork is tested on the latest LTS release of Ubuntu (currently LTS 26.04) since thats the primary system I use. The changes I make are specifically to improve user experience in Linux. The windows compatibilty is untested and untouched.
+
+### List of changes in this fork
 **System level install** 
 - `install.sh` and `uninstall.sh` scripts to put the binaries in system bin (`/usr/local/bin/`), so the programs can be accessed from anywhere.
 - The web UI files are installed to `/usr/local/share/pocketsdr/html/`. When no `-html` is given and `<exe_dir>/../html` doesn't exist, `pocket_web` looks in `<exe_dir>/../share/pocketsdr/html`, so it works for any install prefix.
+
+**Man pages**
+- `man pocket_conf`, `man pocket_trk`, etc. after `install.sh`. The pages in `doc/man/` are **generated** from the command reference [`doc/command_ref.md`](doc/command_ref.md) by `generate-man-pages.sh` (needs pandoc installed); they are not written by hand, although that means unexpected changes in formatting `doc/command_ref.md` can break the script. The markdown source stays the authoritative reference. Rerun `./generate-man-pages.sh` after there is updates to the source and follow it by `./install.sh`. 
 
 **Configuration file handling**
 - The configuration files installed to system level `/usr/local/share/pocketsdr/conf/` and user-modifiable `~/.config/pocketsdr/`.
