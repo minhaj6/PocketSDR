@@ -7,13 +7,14 @@
 
 ---
 
-## Some thoughts regarding my fork
+## Some thoughts regarding Minhaj's fork
 
 I am making some changes that make my life easier when configuring the pocketsdr front-ends and collecting data with them. Dr. Takasu has done an amazing job with this project. I don't intend to submit a pull request to the upstream as these changes may go against the design choices Dr. Takasu made and may not want it in his repo.
 
-### My changes
+### List of changes
 **System level install** 
 - `install.sh` and `uninstall.sh` scripts to put the binaries in system bin (`/usr/local/bin/`), so the programs can be accessed from anywhere.
+- The web UI files are installed to `/usr/local/share/pocketsdr/html/`. When no `-html` is given and `<exe_dir>/../html` doesn't exist, `pocket_web` looks in `<exe_dir>/../share/pocketsdr/html`, so it works for any install prefix.
 
 **Configuration file handling**
 - The configuration files installed to system level `/usr/local/share/pocketsdr/conf/` and user-modifiable `~/.config/pocketsdr/`.
@@ -23,6 +24,7 @@ I am making some changes that make my life easier when configuring the pocketsdr
 
 All of this is to make the user experience smoother when collecting data with the front-ends. I intend to pull updates from Dr. Takasu's repository periodically, as long as I am actively using the pocketsdr devices (probably for a long time). I will be happy if these additions are useful to you. Cheers!
 
+---
 
 ## **Overview**
 

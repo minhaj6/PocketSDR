@@ -6,11 +6,13 @@
 #
 #    binaries -> /usr/local/bin
 #    presets  -> /usr/local/share/pocketsdr/conf
+#    web UI   -> /usr/local/share/pocketsdr/html  (served by pocket_web)
 #
 set -eu
 
 BINDIR=/usr/local/bin
 CONFDIR=/usr/local/share/pocketsdr/conf
+HTMLDIR=/usr/local/share/pocketsdr/html
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # install only copies binaries -- make sure they were built first.
@@ -37,6 +39,10 @@ $SUDO make -C "$ROOT/app" install BIN="$BINDIR"
 $SUDO mkdir -p "$CONFDIR"
 $SUDO cp "$ROOT"/conf/*.conf "$CONFDIR"/
 
+# web UI files for pocket_web (replace, so files removed upstream go away)
+$SUDO rm -rf "$HTMLDIR"
+$SUDO cp -r "$ROOT/html" "$HTMLDIR"
+
 # bash completion (only if the bash-completion framework is installed)
 COMPDIR=/usr/share/bash-completion/completions
 if [ -d "$COMPDIR" ]; then
@@ -46,4 +52,4 @@ else
     echo "bash-completion not found; skipped (script kept at completion/pocket_conf)"
 fi
 
-echo "Installed $built tool(s) to $BINDIR and presets to $CONFDIR"
+echo "Installed $built tool(s) to $BINDIR, presets to $CONFDIR and web UI to $HTMLDIR"

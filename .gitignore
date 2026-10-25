@@ -19,5 +19,6 @@ __pycache__
 /app/pocket_trk/fftw_wisdom
 /app/pocket_snap/pocket_snap
 /app/pocket_calib/pocket_calib
+/app/pocket_web/pocket_web
 /app/convbin/convbin
 /app/str2str/str2str

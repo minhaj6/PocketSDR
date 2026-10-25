@@ -13,6 +13,9 @@
 //
 #include <signal.h>
 #include "pocket_sdr.h"
+#ifndef WIN32
+#include <unistd.h>
+#endif
 
 // constants and macros ---------------------------------------------------------
 #define PROG_NAME  "pocket_web" // program name
@@ -72,6 +75,31 @@ static void show_usage(void)
     exit(0);
 }
 
+// default Web UI dir ----------------------------------------------------------
+//   "" (sdr_web_start() default: <exe_dir>/../html) if it has index.html, else
+//   <exe_dir>/../share/pocketsdr/html if installed there by install.sh, e.g.
+//   /usr/local/bin/pocket_web -> /usr/local/share/pocketsdr/html.
+static const char *def_html_dir(void)
+{
+#ifndef WIN32
+    static char dir[1100];
+    char exe[1024], file[1200];
+    int n = (int)readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return "";
+    exe[n] = '\0';
+    char *p = strrchr(exe, '/');
+    if (p) *p = '\0';
+
+    snprintf(file, sizeof(file), "%s/../html/index.html", exe);
+    if (access(file, R_OK) == 0) return "";
+
+    snprintf(dir, sizeof(dir), "%s/../share/pocketsdr/html", exe);
+    snprintf(file, sizeof(file), "%s/index.html", dir);
+    if (access(file, R_OK) == 0) return dir;
+#endif
+    return "";
+}
+
 // main ------------------------------------------------------------------------
 // Command spec: see doc/command_ref.md.
 int main(int argc, char **argv)
@@ -108,6 +136,9 @@ int main(int argc, char **argv)
     }
     if (port <= 0) {
         show_usage();
+    }
+    if (!*html_dir) {
+        html_dir = def_html_dir();
     }
     if (*debug_file) {
         traceopen(debug_file);
