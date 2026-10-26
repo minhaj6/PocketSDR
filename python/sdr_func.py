@@ -17,6 +17,7 @@
 #  2023-12-27  1.6  support API changes of sdr_func.c
 #  2024-04-04  1.7  support API changes of sdr_func.c
 #  2024-12-20  1.8  support API changes of sdr_func.c
+#  2026-10-25  1.9  add API read_tag()
 #
 from math import *
 from ctypes import *
@@ -52,6 +53,38 @@ LIBSDR_ENA = True  # enable flag of LIBSDR
 carr_tbl = []      # carrier lookup table 
 log_lvl = 3        # log level
 log_str = None     # log stream
+
+#-------------------------------------------------------------------------------
+#  Read the tag file <file>.tag of digitalized IF data file.
+#
+#  args:
+#      file     (I) Digitalized IF data file path
+#
+#  returns:
+#      tag      Dict of FMT (str), NCH (int), F_S (Hz), F_LO (Hz list),
+#               IQ (int list), BITS (int list) (None: no tag file)
+#
+def read_tag(file):
+    try:
+        f = open(file + '.tag', 'r')
+    except OSError:
+        return None
+    tag = {}
+    with f:
+        for line in f:
+            if '=' not in line: continue
+            key, val = [s.strip() for s in line.split('=', 1)]
+            if key == 'FMT':
+                tag[key] = val.upper()
+            elif key == 'NCH':
+                tag[key] = int(val)
+            elif key == 'F_S':
+                tag[key] = float(val) * 1e6
+            elif key == 'F_LO':
+                tag[key] = [float(v) * 1e6 for v in val.split(',')]
+            elif key in ('IQ', 'BITS'):
+                tag[key] = [int(v) for v in val.split(',')]
+    return tag
 
 #-------------------------------------------------------------------------------
 #  Read digitalized IF (inter-frequency) data from file. Supported file formats

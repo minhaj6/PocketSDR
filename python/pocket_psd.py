@@ -11,6 +11,7 @@
 #                   add option -h
 #  2021-12-10  1.1  improve plotting time
 #  2022-01-10  1.2  add OFFSET and SIGMA in histgram plot
+#  2026-10-25  1.3  read IF data format, fs and IQ from <file>.tag  @minhaj
 #
 import sys
 import numpy as np
@@ -110,6 +111,8 @@ def update_hist(ax, p, data, IQ, fc):
 #   Description
 # 
 #     Plot PSD (power spectrum density) and histgram of input digital IF data.
+#     If <file>.tag exists, the format, sampling frequency and I/Q sampling
+#     type are read from it. Options -f and -IQ override the tag.
 # 
 #   Options ([]: default)
 #  
@@ -133,8 +136,8 @@ if __name__ == '__main__':
     window = 'PocketSDR - POWER SPECTRAL DENSITY'
     size = (9, 6)
     tint = 0.01
-    fs = 24e6
-    IQ = 1
+    fs = None
+    IQ = None
     N = 4096
     hist = 0
     file = ''
@@ -169,12 +172,25 @@ if __name__ == '__main__':
         print('Specify input file.')
         exit()
     
+    fmt = 'INT8'
+    tag = sdr_func.read_tag(file)
+    if tag:
+        fmt = tag.get('FMT', fmt)
+        if fmt not in ('INT8', 'INT8X2', 'CS16'):
+            print('Unsupported format: %s' % fmt)
+            exit()
+        if fs is None: fs = tag.get('F_S')
+        if IQ is None: IQ = tag.get('IQ', [None])[0]
+    if fs is None: fs = 24e6
+    if IQ is None: IQ = 1
+    if fmt == 'CS16': IQ = 2
+    
     mpl.rcParams['toolbar'] = 'None';
     mpl.rcParams['font.size'] = 9
     fig = plt.figure(window, figsize=size)
     ax0 = fig.add_axes(rect0)
     ax0.axis('off')
-    ax0.set_title('Digital IF data: FILE = ' + file, fontsize=10)
+    ax0.set_title('Digital IF data: FILE = %s (%s)' % (file, fmt), fontsize=10)
     if hist:
         ax1, p1 = plot_psd(fig, rect1, IQ, fs, fc, bc)
         ax2, p2 = plot_hist(fig, rect2, fc, bc)
@@ -183,7 +199,7 @@ if __name__ == '__main__':
     
     try:
         for i in range(0, 10000000):
-            data = sdr_func.read_data(file, fs, IQ, tint, toff=tint * i)
+            data = sdr_func.read_data(file, fs, IQ, tint, toff=tint * i, fmt=fmt)
             
             if plt.figure(window) != fig: # window closed
                 exit()

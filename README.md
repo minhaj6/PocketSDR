@@ -21,11 +21,15 @@ This fork is tested on the latest LTS release of Ubuntu (currently LTS 26.04) si
 **Man pages**
 - `man pocket_conf`, `man pocket_trk`, etc. after `install.sh`. The pages in `doc/man/` are **generated** from the command reference [`doc/command_ref.md`](doc/command_ref.md) by `generate-man-pages.sh` (needs pandoc installed); they are not written by hand, although that means unexpected changes in formatting `doc/command_ref.md` can break the script. The markdown source stays the authoritative reference. Rerun `./generate-man-pages.sh` after there is updates to the source and follow it by `./install.sh`. 
 
-**Configuration file handling**
+**`pocket_conf` Configuration file autocomplete**
 - The configuration files installed to system level `/usr/local/share/pocketsdr/conf/` and user-modifiable `~/.config/pocketsdr/`.
 - `pocket_conf` app now has a new options `--list` and `--show` to list existing configuration files and show the path of the configuration file.
 - A single header file that resolves paths of configuration file. If a absolute/relative path is given to the `pocket_conf` app for the configuration file, it will use that path. If only a configuration file name is mentioned, it will first search is the `~/.config/pocketsdr/` and then `/usr/local/share/pocketsdr/conf` respectively.
 - Bash autocompletion for the configuration file names. `pocket_conf<TAB>` to autocomplete your configuration file names!
+
+**`.tag` file support in `pocket_psd.py`**
+- `pocket_psd.py` reads `<file>.tag` (written by `pocket_dump`) and takes the IF data format (`FMT`), sampling frequency (`F_S`) and I/Q sampling type (`IQ`) from it, so `pocket_psd.py ch1.bin` is enough for a recording made with `pocket_dump`. `-f` and `-IQ` still override the tag.
+- The tag reader is a reusable function, `read_tag()` in `python/sdr_func.py`.
 
 All of this is to make the user experience smoother when collecting data with the front-ends. I intend to pull updates from Dr. Takasu's repository periodically, as long as I am actively using the pocketsdr devices (probably for a long time). I will be happy if these additions are useful to you. Cheers!
 
